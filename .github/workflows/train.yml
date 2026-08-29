@@ -1,0 +1,166 @@
+# .github/workflows/train.yml
+name: Train operator-square run
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_checkpoint:
+        description: "Canonical source, e.g. attention/run-0001/checkpoints/step-000000"
+        required: true
+        type: string
+
+      target_arm:
+        description: "Operator used for the new training run"
+        required: true
+        default: "amap"
+        type: choice
+        options:
+          - attention
+          - amap
+          - hmap
+          - dmap
+
+      steps:
+        description: "Fresh local optimizer steps for this NEW run"
+        required: true
+        default: "20"
+        type: string
+
+      gpu:
+        description: "Modal GPU type"
+        required: true
+        default: "H100"
+        type: choice
+        options:
+          - H100
+          - H200
+          - B200
+          - A100-80GB
+
+      num_gpus:
+        description: "GPUs in the single Modal container"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "8"
+
+      device_batch_size:
+        description: "Per-device sequence batch; custom eager arms may need 1"
+        required: true
+        default: "1"
+        type: string
+
+      total_batch_size:
+        description: "Total batch in tokens; -1 uses nanochat auto batch"
+        required: true
+        default: "-1"
+        type: string
+
+      data_shards:
+        description: "Number of nanochat pretraining shards to cache/use"
+        required: true
+        default: "240"
+        type: string
+
+      revision:
+        description: "HF_REPO branch/revision for source and destination"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+# Automatic run ids are allocated from the target-arm namespace. Serializing
+# jobs per target arm prevents two GitHub-dispatched runs from choosing the same
+# next run id. Different target arms may still train concurrently.
+concurrency:
+  group: "operator-train-${{ inputs.target_arm }}"
+  cancel-in-progress: false
+
+jobs:
+  train:
+    name: "${{ inputs.source_checkpoint }} -> ${{ inputs.target_arm }} (${{ inputs.steps }} steps)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      HF_REPO: ${{ secrets.HF_REPO }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify required repository secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in HF_REPO HF_TOKEN MODAL_TOKEN_ID MODAL_TOKEN_SECRET; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required repository secret '$name' is not configured."
+              exit 1
+            fi
+          done
+
+      - name: Validate numeric inputs
+        shell: bash
+        env:
+          STEPS: ${{ inputs.steps }}
+          NUM_GPUS: ${{ inputs.num_gpus }}
+          DEVICE_BATCH_SIZE: ${{ inputs.device_batch_size }}
+          TOTAL_BATCH_SIZE: ${{ inputs.total_batch_size }}
+          DATA_SHARDS: ${{ inputs.data_shards }}
+        run: |
+          set -euo pipefail
+
+          [[ "$STEPS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::steps must be a positive integer"; exit 1;
+          }
+          [[ "$NUM_GPUS" =~ ^(1|2|4|8)$ ]] || {
+            echo "::error::num_gpus must be 1, 2, 4, or 8"; exit 1;
+          }
+          [[ "$DEVICE_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::device_batch_size must be positive"; exit 1;
+          }
+          [[ "$DATA_SHARDS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::data_shards must be positive"; exit 1;
+          }
+          [[ "$TOTAL_BATCH_SIZE" == "-1" || "$TOTAL_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::total_batch_size must be -1 or a positive integer"; exit 1;
+          }
+
+      - name: Install Modal CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade modal huggingface_hub
+
+      - name: Train new run on Modal, then publish final checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          modal run modal/train.py \
+            --hf-repo "$HF_REPO" \
+            --source-checkpoint "${{ inputs.source_checkpoint }}" \
+            --target-arm "${{ inputs.target_arm }}" \
+            --steps "${{ inputs.steps }}" \
+            --gpu "${{ inputs.gpu }}" \
+            --num-gpus "${{ inputs.num_gpus }}" \
+            --device-batch-size "${{ inputs.device_batch_size }}" \
+            --total-batch-size "${{ inputs.total_batch_size }}" \
+            --data-shards "${{ inputs.data_shards }}" \
+            --revision "${{ inputs.revision }}"
