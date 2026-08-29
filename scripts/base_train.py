@@ -9,6 +9,27 @@ torchrun --nproc_per_node=8 -m scripts.base_train
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
 python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+
+Attention-variant arms (operator square, see nanochat/gpt.py docstring):
+
+    python -m scripts.base_train --arm=amap ...        # (b,a)=(0,0)
+    python -m scripts.base_train --arm=dmap ...        # (b,a)=(0,1)
+    python -m scripts.base_train --arm=hmap ...        # (b,a)=(1,1)
+    python -m scripts.base_train --arm=attention ...   # standard FA3 path (control)
+
+or with explicit coordinates for square sweeps:
+
+    python -m scripts.base_train --attn-variant=hmap --hmap-beta=0.5 --hmap-alpha=1.0 ...
+
+Operator grafts (pure operator swap on identical weights) use a STRICT
+weights-only warm start:
+
+    python -m scripts.base_train --arm=hmap --init-from-model=/path/model_060000.pt ...
+
+which loads the state_dict key-for-key (any missing/unexpected/shape-mismatched
+key aborts), with a FRESH optimizer and FRESH dataloader at local step 0. This is
+deliberately different from --resume-from-step, which restores optimizer and
+dataloader state for continuing the SAME run.
 """
 
 import os
@@ -25,7 +46,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, Linear, HMAP_ARMS
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -52,6 +73,23 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# --- [variants] Attention operator selection (see nanochat/gpt.py docstring) ---
+parser.add_argument("--arm", type=str, default="", choices=["", "attention", "amap", "dmap", "hmap"],
+                    help="named arm of the operator square; sugar over (--attn-variant, --hmap-beta, --hmap-alpha). "
+                         "'attention' = standard FA3 path. Mutually exclusive with explicit coordinates.")
+parser.add_argument("--attn-variant", type=str, default="standard", choices=["standard", "hmap"],
+                    help="attention mechanism: 'standard' (Karpathy FA3 path) or 'hmap' (eager operator square)")
+parser.add_argument("--hmap-alpha", type=float, default=None,
+                    help="exactness coordinate a in [0,1]: 0=flux face, 1=Doob-potential face (default 0.0)")
+parser.add_argument("--hmap-beta", type=float, default=None,
+                    help="kinetic signature coordinate b in [0,1]: 0=PSD kinetic, 1=full indefinite kernel (default 0.0)")
+parser.add_argument("--witten", action="store_true",
+                    help="add the independent learned Witten potential (two extra Linears per attention block; "
+                         "CHANGES parameter count — breaks key-for-key grafts with witten=False checkpoints)")
+parser.add_argument("--init-from-model", type=str, default="",
+                    help="STRICT weights-only warm start from a raw nanochat state_dict .pt (operator graft): "
+                         "key-for-key load, fresh optimizer, fresh dataloader, local step 0")
+# --- [/variants] ---
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -78,6 +116,29 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+
+# --- [variants] Resolve --arm sugar into explicit operator coordinates ---
+# Done BEFORE user_config capture so provenance records the resolved operator.
+if args.arm:
+    assert args.hmap_alpha is None and args.hmap_beta is None, \
+        "--arm and explicit --hmap-alpha/--hmap-beta are mutually exclusive"
+    if args.arm == "attention":
+        assert args.attn_variant in ("standard",), \
+            "--arm=attention runs the standard FA3 path; do not combine with --attn-variant=hmap"
+        args.attn_variant = "standard"
+        # Recorded for provenance; unused by the standard path. (1,0) is the
+        # attention corner of the square, certified equivalent in tests.
+        args.hmap_beta, args.hmap_alpha = HMAP_ARMS["attention"]
+    else:
+        args.attn_variant = "hmap"
+        args.hmap_beta, args.hmap_alpha = HMAP_ARMS[args.arm]
+# Defaults when neither --arm nor explicit coordinates were given
+args.hmap_alpha = 0.0 if args.hmap_alpha is None else args.hmap_alpha
+args.hmap_beta = 0.0 if args.hmap_beta is None else args.hmap_beta
+assert not (args.resume_from_step != -1 and args.init_from_model), \
+    "--resume-from-step and --init-from-model are mutually exclusive (resume restores optimizer+dataloader; graft starts fresh)"
+# --- [/variants] ---
+
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -102,7 +163,24 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
 using_fa3 = USE_FA3
-if using_fa3:
+if args.attn_variant == "hmap":
+    # --- [variants] The hmap family runs the eager explicit-logits path; FA3 is
+    # not used inside attention for these arms (the flash import stays for the
+    # standard arm). MFU will under-read (extra score matmuls not counted in
+    # estimate_flops); compare arms on loss-vs-step / loss-vs-wallclock.
+    b, a = args.hmap_beta, args.hmap_alpha
+    arm_name = args.arm if args.arm else f"(b={b:g}, a={a:g})"
+    print0(f"Attention variant: hmap {arm_name} | eager explicit-logits path (no FA3 in attention)")
+    print0(f"  operator: 1/2<m,m> - {b:g}*1/2<n,n> + {1.0-a:g}*1/2(<q,k>-<k,q>) + {a:g}*1/2(g_i - g_j), g=1/2||m||^2 - {b:g}*1/2||n||^2")
+    if args.witten:
+        print0("  witten=True: independent learned potential enabled (parameter count differs from witten=False checkpoints)")
+    if args.window_pattern != "L":
+        print0(f"  NOTE: window_pattern='{args.window_pattern}'; the eager mask honors sliding windows, "
+               f"but the operator-square experiments are designed for --window-pattern=L (full causal context).")
+    if args.device_batch_size > 8:
+        print0(f"  NOTE: eager path materializes (B,H,T,T) logits in training; if you OOM, reduce --device-batch-size (8 or 4).")
+    # --- [/variants] ---
+elif using_fa3:
     print0("✓ Using Flash Attention 3: efficient, new and awesome.")
 else:
     print0("!" * 80)
@@ -137,6 +215,12 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        # --- [variants] operator square coordinates ---
+        attn_variant=args.attn_variant,
+        hmap_alpha=args.hmap_alpha,
+        hmap_beta=args.hmap_beta,
+        witten=args.witten,
+        # --- [/variants] ---
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -160,6 +244,38 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+elif args.init_from_model:
+    # --- [variants] STRICT weights-only warm start (operator graft) ---
+    # The operator square is a family of forward passes over ONE parameter
+    # vector, so a graft is a pure operator swap: the checkpoint must be
+    # key-for-key identical to this model. Anything else means a vintage /
+    # wrong-fork / witten-mismatched seed, and we refuse rather than guess.
+    # Fresh optimizer + fresh dataloader; local step starts at 0.
+    print0(f"[graft] Weights-only warm start from {args.init_from_model}")
+    print0("[graft] New optimizer + new dataloader state; local step starts at 0")
+    init_state = torch.load(args.init_from_model, map_location=device, weights_only=True)
+    own_state = model.state_dict()
+    missing = sorted(set(own_state) - set(init_state))
+    unexpected = sorted(set(init_state) - set(own_state))
+    for k in missing:
+        print0(f"[graft]   missing from checkpoint: {k}")
+    for k in unexpected:
+        print0(f"[graft]   unexpected in checkpoint: {k}")
+    shape_bad = [
+        (k, tuple(init_state[k].shape), tuple(own_state[k].shape))
+        for k in set(own_state) & set(init_state)
+        if tuple(init_state[k].shape) != tuple(own_state[k].shape)
+    ]
+    for k, cs, ms in shape_bad:
+        print0(f"[graft]   SHAPE MISMATCH: {k} ckpt{cs} vs model{ms}")
+    assert not shape_bad, "[graft] shape mismatch — wrong tokenizer, depth, or model config for this seed"
+    assert not unexpected, "[graft] seed has keys this model lacks (witten=True seed into witten=False model?) — refusing"
+    assert not missing, "[graft] seed lacks keys this model has (witten=False seed into witten=True model, or vintage checkpoint?) — refusing"
+    model.load_state_dict(init_state, strict=True, assign=True)
+    print0(f"[graft] strict load OK: weights grafted under attn_variant={args.attn_variant} "
+           f"(b={args.hmap_beta:g}, a={args.hmap_alpha:g})")
+    del init_state, own_state
+    # --- [/variants] ---
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -465,12 +581,22 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+        # --- [variants] hmap arms are not wired for kv-cache Engine inference;
+        # use the naive cache-free generate() for them instead.
+        if args.attn_variant == "hmap":
+            for prompt in prompts:
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with disable_fp8(orig_model):
+                    out = list(orig_model.generate(tokens, max_tokens=16, temperature=0))
+                print0(tokenizer.decode(tokens + out))
+        else:
+            engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+            for prompt in prompts:
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with disable_fp8(orig_model):
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                print0(tokenizer.decode(sample[0]))
+        # --- [/variants] ---
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
@@ -484,7 +610,7 @@ while True:
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
+                "user_config": user_config, # inputs to the training script (includes resolved arm/variant/coords for provenance)
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
