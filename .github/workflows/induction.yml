@@ -1,0 +1,163 @@
+# .github/workflows/induction.yml
+name: Induction / DAC Evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      checkpoint:
+        description: "Canonical checkpoint path, e.g. attention/run-0001/checkpoints/step-010000"
+        required: true
+        type: string
+
+      evaluation_arm:
+        description: "Operator used at inference; all evaluates the same weights at all four corners"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - attention
+          - amap
+          - hmap
+          - dmap
+
+      lengths:
+        description: "Comma-separated induction half-lengths L"
+        required: true
+        default: "32,64,128,256,512"
+        type: string
+
+      offsets:
+        description: "Comma-separated DAC source offsets"
+        required: true
+        default: "-2,-1,0,1,2"
+        type: string
+
+      logical_batch_size:
+        description: "Synthetic examples per logical batch"
+        required: true
+        default: "16"
+        type: string
+
+      micro_batch_size:
+        description: "Physical forward batch; 0 = automatic"
+        required: true
+        default: "0"
+        type: string
+
+      max_forward_tokens:
+        description: "Automatic microbatch B*T budget"
+        required: true
+        default: "8192"
+        type: string
+
+      num_batches:
+        description: "Number of logical synthetic batches"
+        required: true
+        default: "4"
+        type: string
+
+      seed:
+        description: "Synthetic benchmark RNG seed"
+        required: true
+        default: "1234"
+        type: string
+
+      top_k:
+        description: "Number of DAC heads to retain in the ranked summary"
+        required: true
+        default: "8"
+        type: string
+
+      behavior_only:
+        description: "Skip DAC hooks and compute only behavioral induction metrics"
+        required: true
+        default: false
+        type: boolean
+
+      gpu:
+        description: "Modal GPU"
+        required: true
+        default: "A10"
+        type: choice
+        options:
+          - A10
+          - L40S
+          - A100-80GB
+          - H100
+
+      revision:
+        description: "Hugging Face model-repo revision/branch"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  induction:
+    name: "${{ inputs.checkpoint }} as ${{ inputs.evaluation_arm }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 390
+
+    env:
+      HF_REPO: ${{ secrets.HF_REPO }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      # modal/induction.py reads this while the App is constructed.
+      NANOCHAT_MODAL_GPU: ${{ inputs.gpu }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify required repository secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in HF_REPO HF_TOKEN MODAL_TOKEN_ID MODAL_TOKEN_SECRET; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required repository secret '$name' is not configured."
+              exit 1
+            fi
+          done
+
+      - name: Install Modal CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade modal
+
+      - name: Run induction experiment on Modal
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=(
+            modal run modal/induction.py
+            --hf-repo "$HF_REPO"
+            --checkpoint "${{ inputs.checkpoint }}"
+            --evaluation-arm "${{ inputs.evaluation_arm }}"
+            --lengths "${{ inputs.lengths }}"
+            --offsets "${{ inputs.offsets }}"
+            --logical-batch-size "${{ inputs.logical_batch_size }}"
+            --micro-batch-size "${{ inputs.micro_batch_size }}"
+            --max-forward-tokens "${{ inputs.max_forward_tokens }}"
+            --num-batches "${{ inputs.num_batches }}"
+            --seed "${{ inputs.seed }}"
+            --top-k "${{ inputs.top_k }}"
+            --revision "${{ inputs.revision }}"
+          )
+
+          if [[ "${{ inputs.behavior_only }}" == "true" ]]; then
+            args+=(--behavior-only)
+          fi
+
+          "${args[@]}"
