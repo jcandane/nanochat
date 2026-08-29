@@ -1,4 +1,4 @@
-"""
+""" nanochat/gpt.py
 GPT model (rewrite, a lot simpler)
 Notable features:
 - rotary embeddings (and no positional embeddings)
@@ -25,8 +25,8 @@ Notation: for context matrix R (N,D) and W = W_Q W_K^T, write script-W = R W R^T
 
     logit_ij = 1/2 <m_i, m_j>                                  [PSD kinetic Gram]
              - b * 1/2 <n_i, n_j>                              [NSD kinetic sector]
-             + (1 - a) * 1/2 (<q_i,k_j> - <k_i,q_j>)           [flux / circulation]
-             + a * 1/2 (g_i - g_j)                             [exact / Doob potential]
+             + a * 1/2 (<q_i,k_j> - <k_i,q_j>)                 [flux / circulation]
+             + (1 - a) * 1/2 (g_i - g_j)                       [exact / Doob potential]
 
     g_i = 1/2 ||m_i||^2 - b * 1/2 ||n_i||^2                    [b-coupled node potential]
         (+ <q^W_i, k^W_i> if witten=True: an independent learned Witten potential,
@@ -38,19 +38,19 @@ b=0 it is the pure PSD potential matching the DMAP arm. This coupling matters: u
 the b=1 diagonal on the b=0 face would add a spurious Witten tilt +1/4||n_j||^2
 sourced from the deleted NSD sector.
 
-Corners of the (b, a) square:
+Corners of the (b, a) square, with both coordinates interpreted as constraint release:
 
-    (b, a) = (0, 0)  AMAP       PSD kinetic + flux            (directed, definite)
-    (b, a) = (0, 1)  DMAP       PSD kinetic + Doob potential  (reversible, definite)
-    (b, a) = (1, 0)  attention  reproduced EXACTLY in the eager branch:
+    (b, a) = (0, 0)  DMAP       PSD kinetic + Doob potential  (most constrained)
+    (b, a) = (0, 1)  AMAP       PSD kinetic + flux            (releases exactness)
+    (b, a) = (1, 0)  HMAP       indefinite kinetic + Doob     (releases signature)
+    (b, a) = (1, 1)  attention  reproduced EXACTLY in the eager branch:
                                  1/2<m,m> - 1/2<n,n> + 1/2(<q,k>-<k,q>) = <q,k>
-    (b, a) = (1, 1)  HMAP       indefinite kinetic + Doob     (reversible, indefinite)
 
 ("CMAP" is reserved for the magnetic/U(1) complex lift and is NOT implemented here;
-the (1,1) corner is real and acquires indefiniteness by subtraction, not by phase.)
+the HMAP (1,0) corner is real and acquires indefiniteness by subtraction, not by phase.)
 
-Softmax gauge: the exact coboundary a/2 (g_i - g_j) collapses under (masked)
-row-softmax to the per-key Doob tilt -a/2 g_j: g_i is row-constant so it washes out;
+Softmax gauge: the exact coboundary (1-a)/2 (g_i - g_j) collapses under (masked)
+row-softmax to the per-key Doob tilt -(1-a)/2 g_j: g_i is row-constant so it washes out;
 we keep both terms anyway (better-conditioned logits, and the code then IS the
 bidivergence equation). The causal mask removes columns, not row-constancy, so the
 collapse survives causality. g is RoPE-invariant (RoPE rotates q_i, k_i by the same
@@ -59,15 +59,15 @@ positional leakage.
 
 Graft DAG (all arms are pure operator swaps on identical weights):
 
-    attention (original d32 checkpoint)
+    attention (1,1; original d32 checkpoint)
         ├──> AMAP  (b: 1 -> 0, kills the NSD sector, keeps flux)
-        ├──> HMAP  (a: 0 -> 1, kills flux, keeps the indefinite kinetic)
-        └──> DMAP  (both), also reachable as AMAP -> DMAP or HMAP -> DMAP.
+        ├──> HMAP  (a: 1 -> 0, kills flux, keeps the indefinite kinetic)
+        └──> DMAP  (both coordinates -> 0), also reachable as AMAP -> DMAP or HMAP -> DMAP.
 
-GAUGE NOTE (DMAP face): at exact (b,a)=(0,1) the loss depends on (W_Q, W_K) only
+GAUGE NOTE (DMAP face): at exact (b,a)=(0,0) the loss depends on (W_Q, W_K) only
 through W_+ = (W_Q + W_K)/sqrt(2); the difference direction W_- is a flat gauge
 orbit. The optimizer will still drift along it, so a DMAP-trained checkpoint's W_-
-is uninformative noise, and any subsequent graft to a<1 or b>0 REACTIVATES that
+is uninformative noise, and any subsequent graft to a>0 or b>0 REACTIVATES that
 drifted direction as live flux/NSD structure. Record grafts in provenance; for a
 clean control, project W_Q, W_K to their mean at the swap.
 
@@ -122,13 +122,13 @@ class GPTConfig:
     # "standard" runs Karpathy's untouched FA3/SDPA path (the control arm).
     # "hmap" runs the eager operator square below.
     attn_variant: str = "standard"
-    # Exactness coordinate a: 0 = full flux (curl face), 1 = full Doob potential
-    # (gradient face). Interpolates circulation -> exact sector.
+    # Exactness-release coordinate a: 0 = full Doob/exact sector (constrained),
+    # 1 = full flux/circulation sector (released).
     hmap_alpha: float = 0.0
-    # Kinetic signature coordinate b: 0 = PSD kinetic (1/2 W_M W_M^T only),
+    # Signature-release coordinate b: 0 = PSD kinetic (constrained),
     # 1 = full indefinite symmetric kernel W_S = 1/2 W_M W_M^T - 1/2 W_N W_N^T.
-    # Corners: (b,a) = (0,0) AMAP, (0,1) DMAP, (1,0) attention (exact, eager),
-    # (1,1) HMAP (reversible indefinite).
+    # Corners: (b,a) = (0,0) DMAP, (0,1) AMAP, (1,0) HMAP,
+    # (1,1) attention (exact, eager).
     hmap_beta: float = 0.0
     # Independent learned Witten potential g^W_i = <q^W_i, k^W_i> added to the
     # exact sector. Adds two Linear projections per attention block
@@ -142,12 +142,12 @@ class GPTConfig:
 # Named arms of the square, for configs/provenance. Usage:
 #   b, a = HMAP_ARMS["dmap"];  GPTConfig(attn_variant="hmap", hmap_beta=b, hmap_alpha=a)
 # "attention" should normally use attn_variant="standard" (flash path, exact
-# baseline); the (1,0) eager corner exists to certify equivalence in tests.
+# baseline); the (1,1) eager corner exists to certify equivalence in tests.
 HMAP_ARMS = {
-    "amap": (0.0, 0.0),
-    "dmap": (0.0, 1.0),
-    "attention": (1.0, 0.0),
-    "hmap": (1.0, 1.0),
+    "dmap": (0.0, 0.0),
+    "amap": (0.0, 1.0),
+    "hmap": (1.0, 0.0),
+    "attention": (1.0, 1.0),
 }
 
 
@@ -281,10 +281,10 @@ class CausalSelfAttention(nn.Module):
         # diagonal bias; the 1.2x factors scale all sectors uniformly).
         # v is untouched.
         #   logits = 1/2<m,m> - b*1/2<n,n>
-        #          + (1-a)*1/2(<q,k>-<k,q>) + a*1/2(g_i - g_j)
+        #          + a*1/2(<q,k>-<k,q>) + (1-a)*1/2(g_i - g_j)
         #   g_i    = 1/2||m_i||^2 - b*1/2||n_i||^2   (diag of the OPERATIVE kernel)
-        # Corners: (b,a) = (0,0) AMAP, (0,1) DMAP, (1,0) attention (exact),
-        # (1,1) HMAP.
+        # Corners: (b,a) = (0,0) DMAP, (0,1) AMAP, (1,0) HMAP,
+        # (1,1) attention (exact).
         # ------------------------------------------------------------------
         if self.attn_variant == "hmap":
             if kv_cache is not None:
@@ -307,7 +307,7 @@ class CausalSelfAttention(nn.Module):
             # fp32 accumulation: g is a DIFFERENCE of comparable quadratics
             # entering as a per-key tilt — exactly where bf16 cancellation bites.
             g = None
-            if a > 0.0:
+            if a < 1.0:
                 g32 = 0.5 * (m.float() * m.float()).sum(-1)              # (B,H,T)
                 if b > 0.0:
                     # n is not None here since b > 0
@@ -327,17 +327,17 @@ class CausalSelfAttention(nn.Module):
             def _hmap_block(q_blk, k_blk, m_blk, n_blk, g_blk, rows):
                 """Attention output for a block of query rows against all keys.
                 logits = 1/2<m,m> - b*1/2<n,n>
-                       + (1-a)*1/2(<q,k>-<k,q>) + a*1/2(g_i - g_j)
-                (b,a): (0,0)=AMAP, (0,1)=DMAP, (1,0)=attention, (1,1)=HMAP."""
+                       + a*1/2(<q,k>-<k,q>) + (1-a)*1/2(g_i - g_j)
+                (b,a): (0,0)=DMAP, (0,1)=AMAP, (1,0)=HMAP, (1,1)=attention."""
                 logits = 0.5 * (m_blk @ m.transpose(-2, -1))        # PSD kinetic rows
                 if b > 0.0:
                     logits = logits - b * 0.5 * (n_blk @ n.transpose(-2, -1))  # NSD sector
-                if a < 1.0:
+                if a > 0.0:
                     qk = q_blk @ kh.transpose(-2, -1)
                     kq = k_blk @ qh.transpose(-2, -1)
-                    logits = logits + (1.0 - a) * 0.5 * (qk - kq)   # flux rows
-                if a > 0.0:
-                    logits = logits + a * 0.5 * (g_blk.unsqueeze(-1) - g.unsqueeze(-2))
+                    logits = logits + a * 0.5 * (qk - kq)   # flux rows
+                if a < 1.0:
+                    logits = logits + (1.0 - a) * 0.5 * (g_blk.unsqueeze(-1) - g.unsqueeze(-2))
                 logits = logits * scale + mask[rows]                # broadcast over (B,H)
                 return logits.softmax(dim=-1) @ vh
 
@@ -598,9 +598,10 @@ class GPT(nn.Module):
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
 
-        NOTE: HMAP computes additional score matmuls (kinetic Gram + flux) that
-        this estimate does not account for, so reported MFU under-reads for HMAP
-        runs. Compare variants on loss-vs-step / loss-vs-wallclock, not MFU.
+        NOTE: the eager operator-family path computes additional score matmuls
+        (kinetic Gram and, when a>0, flux) that this estimate does not account for,
+        so reported MFU under-reads. Compare variants on loss-vs-step /
+        loss-vs-wallclock, not MFU.
         """
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
