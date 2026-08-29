@@ -1,5 +1,4 @@
-"""experiments/common/checkpoints.py
-Checkpoint identities, paths, and strict state-dict I/O for experiments.
+"""Checkpoint identities, paths, and strict state-dict I/O for experiments.
 
 This module defines the *portable* checkpoint contract used by the research
 layer. It deliberately does **not** know how to talk to Hugging Face, Modal, or
