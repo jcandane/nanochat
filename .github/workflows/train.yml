@@ -1,16 +1,26 @@
 # .github/workflows/train.yml
-name: Train operator-square run
+name: Train or recover operator-square run
 
 on:
   workflow_dispatch:
     inputs:
-      source_checkpoint:
-        description: "Canonical source, e.g. attention/run-0001/checkpoints/step-000000"
+      mode:
+        description: "train = new run; recover = publish a completed pending Modal job"
         required: true
+        default: "train"
+        type: choice
+        options:
+          - train
+          - recover
+
+      source_checkpoint:
+        description: "Train mode: canonical source checkpoint"
+        required: false
+        default: "attention/run-0001/checkpoints/step-000000"
         type: string
 
       target_arm:
-        description: "Operator used for the new training run"
+        description: "Train mode: operator used for the NEW run"
         required: true
         default: "amap"
         type: choice
@@ -21,13 +31,19 @@ on:
           - dmap
 
       steps:
-        description: "Fresh local optimizer steps for this NEW run"
+        description: "Train mode: fresh local optimizer steps"
         required: true
         default: "20"
         type: string
 
+      pending_job:
+        description: "Recover mode: 'latest' or a pending job id/sub-string"
+        required: true
+        default: "latest"
+        type: string
+
       gpu:
-        description: "Modal GPU type"
+        description: "Train mode: Modal GPU type"
         required: true
         default: "H100"
         type: choice
@@ -38,7 +54,7 @@ on:
           - A100-80GB
 
       num_gpus:
-        description: "GPUs in the single Modal container"
+        description: "Train mode: GPUs in one Modal container"
         required: true
         default: "1"
         type: choice
@@ -49,25 +65,25 @@ on:
           - "8"
 
       device_batch_size:
-        description: "Per-device sequence batch; custom eager arms may need 1"
+        description: "Train mode: per-device sequence batch"
         required: true
         default: "1"
         type: string
 
       total_batch_size:
-        description: "Total batch in tokens; -1 uses nanochat auto batch"
+        description: "Train mode: total batch in tokens; 2048 = one d32 sequence on 1 GPU"
         required: true
-        default: "-1"
+        default: "2048"
         type: string
 
       data_shards:
-        description: "Number of nanochat pretraining shards to cache/use"
+        description: "Train mode: nanochat pretraining shards"
         required: true
         default: "240"
         type: string
 
       revision:
-        description: "HF_REPO branch/revision for source and destination"
+        description: "HF_REPO branch/revision"
         required: true
         default: "main"
         type: string
@@ -75,16 +91,14 @@ on:
 permissions:
   contents: read
 
-# Automatic run ids are allocated from the target-arm namespace. Serializing
-# jobs per target arm prevents two GitHub-dispatched runs from choosing the same
-# next run id. Different target arms may still train concurrently.
+# Serialize run allocation and recovery. Pending jobs reserve their run id in the
+# Modal volume, but a single queue is the simplest additional collision guard.
 concurrency:
-  group: "operator-train-${{ inputs.target_arm }}"
+  group: operator-square-train-publish
   cancel-in-progress: false
 
 jobs:
-  train:
-    name: "${{ inputs.source_checkpoint }} -> ${{ inputs.target_arm }} (${{ inputs.steps }} steps)"
+  train-or-recover:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -114,9 +128,11 @@ jobs:
             fi
           done
 
-      - name: Validate numeric inputs
+      - name: Validate train-mode inputs
+        if: ${{ inputs.mode == 'train' }}
         shell: bash
         env:
+          SOURCE_CHECKPOINT: ${{ inputs.source_checkpoint }}
           STEPS: ${{ inputs.steps }}
           NUM_GPUS: ${{ inputs.num_gpus }}
           DEVICE_BATCH_SIZE: ${{ inputs.device_batch_size }}
@@ -124,7 +140,9 @@ jobs:
           DATA_SHARDS: ${{ inputs.data_shards }}
         run: |
           set -euo pipefail
-
+          [[ -n "$SOURCE_CHECKPOINT" ]] || {
+            echo "::error::source_checkpoint is required in train mode"; exit 1;
+          }
           [[ "$STEPS" =~ ^[1-9][0-9]*$ ]] || {
             echo "::error::steps must be a positive integer"; exit 1;
           }
@@ -148,16 +166,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --upgrade modal huggingface_hub
 
-      - name: Train new run on Modal, then publish final checkpoint
+      - name: Train or recover on Modal
         shell: bash
         run: |
           set -euo pipefail
 
           modal run modal/train.py \
             --hf-repo "$HF_REPO" \
+            --mode "${{ inputs.mode }}" \
             --source-checkpoint "${{ inputs.source_checkpoint }}" \
             --target-arm "${{ inputs.target_arm }}" \
             --steps "${{ inputs.steps }}" \
+            --pending-job "${{ inputs.pending_job }}" \
             --gpu "${{ inputs.gpu }}" \
             --num-gpus "${{ inputs.num_gpus }}" \
             --device-batch-size "${{ inputs.device_batch_size }}" \
