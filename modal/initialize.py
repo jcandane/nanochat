@@ -690,26 +690,109 @@ else:
             )
 
         from huggingface_hub import HfApi
+        from huggingface_hub.utils import RepositoryNotFoundError
 
         api = HfApi(token=token)
 
-        # Fail early if HF_REPO is wrong or the supplied token cannot access it.
-        # Hugging Face intentionally uses RepositoryNotFoundError for both a
-        # nonexistent repo and an inaccessible private repo.
+        # First prove that the secret is a real HF token and show which account
+        # it belongs to. Never print the token itself.
+        try:
+            identity = api.whoami(token=token)
+        except Exception as exc:
+            raise RuntimeError(
+                "HF_TOKEN could not authenticate with Hugging Face. "
+                "Replace the GitHub Actions HF_TOKEN secret with a valid "
+                "User Access Token."
+            ) from exc
+
+        hf_user = str(identity.get("name") or "<unknown>")
+        print(
+            f"[initialize] Hugging Face authenticated as: {hf_user}",
+            flush=True,
+        )
+        print(
+            f"[initialize] canonical target model repo: {hf_repo}",
+            flush=True,
+        )
+
+        target_namespace = hf_repo.split("/", 1)[0]
+        if hf_user != "<unknown>" and target_namespace != hf_user:
+            # This can be completely valid for organization-owned repositories,
+            # so it is diagnostic only rather than a hard failure.
+            print(
+                "[initialize] note: target namespace differs from authenticated "
+                f"user ({target_namespace!r} vs {hf_user!r}); this is valid only "
+                "if the token has write access to that namespace.",
+                flush=True,
+            )
+
+        # HF intentionally returns RepositoryNotFoundError for both:
+        #   1. a model repo that does not exist, and
+        #   2. a private model repo this token cannot see.
+        #
+        # Because this is the one-time initializer, the correct response is to
+        # attempt idempotent private-repo creation. If the repo already exists
+        # but is inaccessible, create_repo will itself fail with a permission
+        # error rather than silently replacing anything.
         try:
             api.repo_info(
                 repo_id=hf_repo,
                 repo_type="model",
                 token=token,
             )
-        except Exception as exc:
-            if exc.__class__.__name__ == "RepositoryNotFoundError":
+            print(
+                f"[initialize] target repo already exists and is readable: "
+                f"{hf_repo}",
+                flush=True,
+            )
+        except RepositoryNotFoundError:
+            print(
+                f"[initialize] target repo is not visible; attempting to create "
+                f"private model repo {hf_repo}",
+                flush=True,
+            )
+            try:
+                created = api.create_repo(
+                    repo_id=hf_repo,
+                    repo_type="model",
+                    private=True,
+                    exist_ok=True,
+                    token=token,
+                )
+            except Exception as exc:
                 raise RuntimeError(
-                    "HF_REPO could not be accessed. Check that the repo exists, "
-                    "HF_REPO is 'owner/repo' (or its Hugging Face URL), and "
-                    "HF_TOKEN has write access to that private/model repo."
+                    f"HF authenticated as {hf_user!r}, but could not create or "
+                    f"access model repo {hf_repo!r}. If the repo already exists, "
+                    "the token does not have access to it. If it does not exist, "
+                    "the token needs write permission for that namespace."
                 ) from exc
-            raise
+
+            print(
+                f"[initialize] target repo ready: {created}",
+                flush=True,
+            )
+
+        # Do not proceed to a multi-GB conversion unless the token can actually
+        # write to the destination.
+        try:
+            api.auth_check(
+                repo_id=hf_repo,
+                repo_type="model",
+                token=token,
+                write=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"HF authenticated as {hf_user!r} and can resolve {hf_repo!r}, "
+                "but the token does not have content write permission there. "
+                "Use a write-capable User Access Token (or a fine-grained token "
+                "with write access to this repo)."
+            ) from exc
+
+        print(
+            f"[initialize] write access confirmed: {hf_repo}",
+            flush=True,
+        )
 
         existing = set(
             api.list_repo_files(
