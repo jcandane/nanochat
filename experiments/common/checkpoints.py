@@ -1,4 +1,5 @@
-"""Checkpoint identities, paths, and strict state-dict I/O for experiments.
+"""experiments/common/checkpoints.py
+Checkpoint identities, paths, and strict state-dict I/O for experiments.
 
 This module defines the *portable* checkpoint contract used by the research
 layer. It deliberately does **not** know how to talk to Hugging Face, Modal, or
@@ -54,6 +55,20 @@ _RUN_ID_RE = re.compile(r"^run-(\d{4,})$")
 _STEP_DIR_RE = re.compile(r"^step-(\d+)$")
 
 
+def validate_run_id(run_id: str) -> str:
+    """Validate and return a canonical run id such as ``run-0001``.
+
+    This helper is intentionally public because provenance construction needs
+    to validate run identities without constructing a synthetic checkpoint.
+    """
+    if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+        raise ValueError(
+            f"invalid run_id {run_id!r}; expected 'run-' followed by at least "
+            "four digits, e.g. 'run-0001'"
+        )
+    return run_id
+
+
 class CheckpointError(RuntimeError):
     """Base class for experiment checkpoint errors."""
 
@@ -84,11 +99,7 @@ class CheckpointRef:
         normalized = normalize_arm_name(str(self.arm))
         object.__setattr__(self, "arm", normalized)
 
-        if not _RUN_ID_RE.fullmatch(self.run_id):
-            raise ValueError(
-                f"invalid run_id {self.run_id!r}; expected 'run-' followed by "
-                "at least four digits, e.g. 'run-0001'"
-            )
+        validate_run_id(self.run_id)
         if isinstance(self.step, bool) or not isinstance(self.step, int) or self.step < 0:
             raise ValueError(f"step must be a non-negative integer, got {self.step!r}")
 
@@ -616,6 +627,7 @@ __all__ = [
     "CheckpointError",
     "CheckpointFormatError",
     "StateDictMismatchError",
+    "validate_run_id",
     "CheckpointRef",
     "LocalCheckpoint",
     "ShapeMismatch",
