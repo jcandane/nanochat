@@ -637,7 +637,6 @@ else:
         image=image,
         cpu=16,
         memory=65536,
-        ephemeral_disk=65536,
         timeout=6 * 60 * 60,
         retries=0,
         volumes={CACHE_DIR: cache_volume},
