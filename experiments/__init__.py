@@ -1,12 +1,7 @@
-"""Shared experiment utilities."""
+# experiments/__init__.py
+"""experiments/__init__.py
+Research experiments built on top of nanochat.
 
-from .arms import ARM_NAMES, ArmName, ArmSpec, get_arm, iter_arms, normalize_arm_name
-
-__all__ = [
-    "ARM_NAMES",
-    "ArmName",
-    "ArmSpec",
-    "get_arm",
-    "iter_arms",
-    "normalize_arm_name",
-]
+Scientific experiment code lives under this package. Remote execution,
+Hugging Face transport, and CI orchestration live outside it.
+"""
