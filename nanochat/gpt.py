@@ -10,6 +10,81 @@ Notable features:
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
 - Flash Attention 3 integration
+- Attention variants (attn_variant): "standard" | "hmap"
+
+================================ THE OPERATOR SQUARE ================================
+
+HMAP family (coupled form): a two-parameter family of transport operators over ONE
+parameter vector. All corners share the exact same state_dict (same c_q, c_k, c_v,
+c_proj, value embeds, gates, scalars) unless witten=True; the operators differ only
+in how the forward pass recombines q and k into logits.
+
+Notation: for context matrix R (N,D) and W = W_Q W_K^T, write script-W = R W R^T
+(weights in context), m = (q + k)/sqrt(2) and n = (q - k)/sqrt(2) the sum/difference
+(kinetic) vectors. Per head, post-RoPE/QK-norm/1.2x:
+
+    logit_ij = 1/2 <m_i, m_j>                                  [PSD kinetic Gram]
+             - b * 1/2 <n_i, n_j>                              [NSD kinetic sector]
+             + (1 - a) * 1/2 (<q_i,k_j> - <k_i,q_j>)           [flux / circulation]
+             + a * 1/2 (g_i - g_j)                             [exact / Doob potential]
+
+    g_i = 1/2 ||m_i||^2 - b * 1/2 ||n_i||^2                    [b-coupled node potential]
+        (+ <q^W_i, k^W_i> if witten=True: an independent learned Witten potential,
+         adds two Linears per attention block -> parameter count changes)
+
+The potential g is the diagonal of the OPERATIVE symmetric kernel at deformation b
+(the bidivergence convention w = diag(score)): at b=1, g_i = <q_i, k_i> exactly; at
+b=0 it is the pure PSD potential matching the DMAP arm. This coupling matters: using
+the b=1 diagonal on the b=0 face would add a spurious Witten tilt +1/4||n_j||^2
+sourced from the deleted NSD sector.
+
+Corners of the (b, a) square:
+
+    (b, a) = (0, 0)  AMAP       PSD kinetic + flux            (directed, definite)
+    (b, a) = (0, 1)  DMAP       PSD kinetic + Doob potential  (reversible, definite)
+    (b, a) = (1, 0)  attention  reproduced EXACTLY in the eager branch:
+                                 1/2<m,m> - 1/2<n,n> + 1/2(<q,k>-<k,q>) = <q,k>
+    (b, a) = (1, 1)  HMAP       indefinite kinetic + Doob     (reversible, indefinite)
+
+("CMAP" is reserved for the magnetic/U(1) complex lift and is NOT implemented here;
+the (1,1) corner is real and acquires indefiniteness by subtraction, not by phase.)
+
+Softmax gauge: the exact coboundary a/2 (g_i - g_j) collapses under (masked)
+row-softmax to the per-key Doob tilt -a/2 g_j: g_i is row-constant so it washes out;
+we keep both terms anyway (better-conditioned logits, and the code then IS the
+bidivergence equation). The causal mask removes columns, not row-constancy, so the
+collapse survives causality. g is RoPE-invariant (RoPE rotates q_i, k_i by the same
+angle, preserving <q_i,k_i>, ||m_i||, ||n_i||), so the potential sector carries no
+positional leakage.
+
+Graft DAG (all arms are pure operator swaps on identical weights):
+
+    attention (original d32 checkpoint)
+        ├──> AMAP  (b: 1 -> 0, kills the NSD sector, keeps flux)
+        ├──> HMAP  (a: 0 -> 1, kills flux, keeps the indefinite kinetic)
+        └──> DMAP  (both), also reachable as AMAP -> DMAP or HMAP -> DMAP.
+
+GAUGE NOTE (DMAP face): at exact (b,a)=(0,1) the loss depends on (W_Q, W_K) only
+through W_+ = (W_Q + W_K)/sqrt(2); the difference direction W_- is a flat gauge
+orbit. The optimizer will still drift along it, so a DMAP-trained checkpoint's W_-
+is uninformative noise, and any subsequent graft to a<1 or b>0 REACTIVATES that
+drifted direction as live flux/NSD structure. Record grafts in provenance; for a
+clean control, project W_Q, W_K to their mean at the swap.
+
+COUPLED (this file): flux and potential are built from the SAME q, k as the kinetic
+sector — no new parameters, checkpoint structure unchanged (unless witten=True).
+The decoupled two-projection form (frozen qkv + trainable hmap_qk) belongs to the
+transfer-ansatz/finetune experiment and is not in this file.
+
+Implementation is EAGER (explicit (B,H,T,T) logits): transparent, no FA3 head-dim
+questions, you own the operator outright. Memory scales with T^2 — reduce
+--device-batch-size (e.g. 8 or 4) vs the default 32. Training and naive generate()
+only; kv-cache fast inference (engine.py) is not wired for HMAP. Intended to run
+with window_pattern="L" (full causal context); sliding windows are honored if
+present (mask reproduces FA3 (left,0) semantics). estimate_flops() does not count
+the extra score matmuls, so MFU under-reads for HMAP runs: compare variants on
+loss-vs-step / loss-vs-wallclock, not MFU.
+=====================================================================================
 """
 
 from functools import partial
@@ -25,6 +100,12 @@ from nanochat.optim import MuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
 
+# Module-level eager-mask cache: shared across all attention layers and model
+# instances (masks are layer-independent). Bucketed to 256-multiples in
+# _get_eager_mask, so it holds at most a handful of entries per device.
+_EAGER_MASK_CACHE = {}
+
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -37,6 +118,37 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Attention mechanism: "standard" | "hmap".
+    # "standard" runs Karpathy's untouched FA3/SDPA path (the control arm).
+    # "hmap" runs the eager operator square below.
+    attn_variant: str = "standard"
+    # Exactness coordinate a: 0 = full flux (curl face), 1 = full Doob potential
+    # (gradient face). Interpolates circulation -> exact sector.
+    hmap_alpha: float = 0.0
+    # Kinetic signature coordinate b: 0 = PSD kinetic (1/2 W_M W_M^T only),
+    # 1 = full indefinite symmetric kernel W_S = 1/2 W_M W_M^T - 1/2 W_N W_N^T.
+    # Corners: (b,a) = (0,0) AMAP, (0,1) DMAP, (1,0) attention (exact, eager),
+    # (1,1) HMAP (reversible indefinite).
+    hmap_beta: float = 0.0
+    # Independent learned Witten potential g^W_i = <q^W_i, k^W_i> added to the
+    # exact sector. Adds two Linear projections per attention block
+    # (parameter count changes — breaks key-for-key grafts with witten=False runs).
+    witten: bool = False
+    # Bidirectional attention (no causal mask) for MLM-style objectives.
+    # Use with window_pattern="L"; sliding windows become two-sided if set.
+    bidirectional: bool = False
+
+
+# Named arms of the square, for configs/provenance. Usage:
+#   b, a = HMAP_ARMS["dmap"];  GPTConfig(attn_variant="hmap", hmap_beta=b, hmap_alpha=a)
+# "attention" should normally use attn_variant="standard" (flash path, exact
+# baseline); the (1,0) eager corner exists to certify equivalence in tests.
+HMAP_ARMS = {
+    "amap": (0.0, 0.0),
+    "dmap": (0.0, 1.0),
+    "attention": (1.0, 0.0),
+    "hmap": (1.0, 1.0),
+}
 
 
 def norm(x):
@@ -74,12 +186,71 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.attn_variant = config.attn_variant
+        self.hmap_alpha = config.hmap_alpha
+        self.hmap_beta = config.hmap_beta
+        self.witten = config.witten
+        self.bidirectional = config.bidirectional
+        if self.attn_variant == "hmap":
+            # HMAP builds flux and potential from q_j AND k_j per token/head.
+            # Under GQA the kv heads don't align 1:1 with query heads, so the
+            # per-head construction is ill-defined. Require MHA (d12 default: 6/6).
+            assert config.n_kv_head == config.n_head, \
+                "attn_variant='hmap' requires n_kv_head == n_head (no GQA)"
+            assert 0.0 <= self.hmap_alpha <= 1.0, f"hmap_alpha in [0,1], got {self.hmap_alpha}"
+            assert 0.0 <= self.hmap_beta <= 1.0, f"hmap_beta in [0,1], got {self.hmap_beta}"
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        # Witten potential projections: g^W_i = <q^W_i, k^W_i> = diag(R W_W R^T),
+        # W_W = W_QW^T W_KW factored per head. Only exist when enabled.
+        if self.attn_variant == "hmap" and self.witten:
+            self.c_qw = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+            self.c_kw = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        else:
+            self.c_qw = None
+            self.c_kw = None
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Eager attention masks are shared MODULE-LEVEL (see _EAGER_MASK_CACHE):
+        # masks are identical across layers, and a per-instance cache multiplies
+        # the footprint by n_layer (32x at d32 — the second half of the
+        # CORE-eval memory leak).
+
+    def _get_eager_mask(self, T, window_size, device):
+        """Additive (-inf) mask. Causal mode reproduces FA3 semantics:
+        window_size=(left, 0): i attends to j iff i - left <= j <= i.
+        Bidirectional mode: all pairs allowed (two-sided |i-j| <= left if a
+        finite window is set).
+
+        Cache is MODULE-LEVEL (shared by all layers: masks are layer-
+        independent) and BUCKETED: masks are built at T rounded up to a
+        multiple of 256 and served as the top-left (T, T) slice — the leading
+        principal submatrix of a causal band mask is exactly the band mask
+        for the smaller length. Without both, variable-length evaluation
+        leaks unboundedly: per-length x per-layer masks reached ~76GB over
+        18 CORE tasks and ~58GB more within squad alone at d32."""
+        left = window_size[0]
+        Tb = ((T + 255) // 256) * 256
+        key = (Tb, left, self.bidirectional, str(device))
+        mask = _EAGER_MASK_CACHE.get(key)
+        if mask is None:
+            i = torch.arange(Tb, device=device).view(Tb, 1)
+            j = torch.arange(Tb, device=device).view(1, Tb)
+            if self.bidirectional:
+                allowed = torch.ones(Tb, Tb, dtype=torch.bool, device=device)
+                if left >= 0 and left < Tb:
+                    allowed = (j - i).abs() <= left
+            else:
+                allowed = (j <= i)
+                if left >= 0:
+                    allowed = allowed & (j >= i - left)
+            mask = torch.zeros(Tb, Tb, device=device, dtype=torch.float32)
+            mask.masked_fill_(~allowed, float("-inf"))
+            mask = mask.to(COMPUTE_DTYPE)
+            _EAGER_MASK_CACHE[key] = mask
+        return mask[:T, :T]
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -103,12 +274,106 @@ class CausalSelfAttention(nn.Module):
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
+        # ------------------------------------------------------------------
+        # HMAP family (coupled, eager). Consumes the post-RoPE, post-QK-norm,
+        # post-1.2x q,k: the operator is imposed on the vectors the model
+        # actually scores with (QK-norm bounds ||m||^2, tempering the kinetic
+        # diagonal bias; the 1.2x factors scale all sectors uniformly).
+        # v is untouched.
+        #   logits = 1/2<m,m> - b*1/2<n,n>
+        #          + (1-a)*1/2(<q,k>-<k,q>) + a*1/2(g_i - g_j)
+        #   g_i    = 1/2||m_i||^2 - b*1/2||n_i||^2   (diag of the OPERATIVE kernel)
+        # Corners: (b,a) = (0,0) AMAP, (0,1) DMAP, (1,0) attention (exact),
+        # (1,1) HMAP.
+        # ------------------------------------------------------------------
+        if self.attn_variant == "hmap":
+            if kv_cache is not None:
+                raise NotImplementedError(
+                    "attn_variant='hmap' does not support kv-cache inference yet. "
+                    "Training and naive generate() work.")
+            a = self.hmap_alpha
+            b = self.hmap_beta
+            qh = q.transpose(1, 2)   # (B, H, T, D)
+            kh = k.transpose(1, 2)
+            vh = v.transpose(1, 2)
+
+            # Kinetic sector vectors.
+            m = (qh + kh) * (0.5 ** 0.5)
+            n = (qh - kh) * (0.5 ** 0.5) if b > 0.0 else None
+
+            # Node potential, coupled to b: g = 1/2||m||^2 - b*1/2||n||^2.
+            # At b=1 this equals <q_i,k_i> = diag(script-W) exactly; at b=0 it is
+            # the pure PSD potential (no tilt from the deleted NSD sector).
+            # fp32 accumulation: g is a DIFFERENCE of comparable quadratics
+            # entering as a per-key tilt — exactly where bf16 cancellation bites.
+            g = None
+            if a > 0.0:
+                g32 = 0.5 * (m.float() * m.float()).sum(-1)              # (B,H,T)
+                if b > 0.0:
+                    # n is not None here since b > 0
+                    g32 = g32 - b * 0.5 * (n.float() * n.float()).sum(-1)
+                if self.witten:
+                    qw = self.c_qw(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+                    kw = self.c_kw(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+                    # Same scale control as q,k (norm AND the 1.2x factors), so the
+                    # learned potential enters at the same scale as the natural g.
+                    qw, kw = norm(qw) * 1.2, norm(kw) * 1.2
+                    g32 = g32 + (qw.float() * kw.float()).sum(-1)
+                g = g32.to(qh.dtype)
+
+            scale = self.head_dim ** -0.5
+            mask = self._get_eager_mask(T, window_size, x.device)   # (T,T)
+
+            def _hmap_block(q_blk, k_blk, m_blk, n_blk, g_blk, rows):
+                """Attention output for a block of query rows against all keys.
+                logits = 1/2<m,m> - b*1/2<n,n>
+                       + (1-a)*1/2(<q,k>-<k,q>) + a*1/2(g_i - g_j)
+                (b,a): (0,0)=AMAP, (0,1)=DMAP, (1,0)=attention, (1,1)=HMAP."""
+                logits = 0.5 * (m_blk @ m.transpose(-2, -1))        # PSD kinetic rows
+                if b > 0.0:
+                    logits = logits - b * 0.5 * (n_blk @ n.transpose(-2, -1))  # NSD sector
+                if a < 1.0:
+                    qk = q_blk @ kh.transpose(-2, -1)
+                    kq = k_blk @ qh.transpose(-2, -1)
+                    logits = logits + (1.0 - a) * 0.5 * (qk - kq)   # flux rows
+                if a > 0.0:
+                    logits = logits + a * 0.5 * (g_blk.unsqueeze(-1) - g.unsqueeze(-2))
+                logits = logits * scale + mask[rows]                # broadcast over (B,H)
+                return logits.softmax(dim=-1) @ vh
+
+            if torch.is_grad_enabled():
+                # Training: full (B,H,T,T) logits, identical to the validated path.
+                y = _hmap_block(qh, kh, m, n, g, slice(0, T))
+            else:
+                # Evaluation (bpb, CORE, generate): chunk query rows so the full
+                # T x T logits never materialize — fixes CORE-eval OOM while
+                # training state is resident. Numerics identical (row-wise
+                # softmax is independent across query rows).
+                chunk = 256
+                outs = []
+                for s in range(0, T, chunk):
+                    rows = slice(s, min(s + chunk, T))
+                    outs.append(_hmap_block(
+                        qh[..., rows, :], kh[..., rows, :], m[..., rows, :],
+                        n[..., rows, :] if n is not None else None,
+                        g[..., rows] if g is not None else None, rows))
+                y = torch.cat(outs, dim=-2)
+
+            y = y.transpose(1, 2).contiguous().view(B, T, -1)
+            y = self.c_proj(y)
+            return y
+
         # Flash Attention (FA3 or SDPA fallback)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        # Causal: window_size (left, right) = (N, 0). Bidirectional (MLM):
+        # causal=False and a fully open window (right=0 would still hide the
+        # future, so it must be lifted).
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            if self.bidirectional:
+                y = flash_attn.flash_attn_func(q, k, v, causal=False, window_size=(-1, -1))
+            else:
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
+            assert not self.bidirectional, "kv-cache inference is causal-only"
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
@@ -211,6 +476,7 @@ class GPT(nn.Module):
             attn.c_q:        uniform, std=1/sqrt(n_embd)
             attn.c_k:        uniform, std=1/sqrt(n_embd)
             attn.c_v:        uniform, std=1/sqrt(n_embd)
+            attn.c_qw/c_kw:  uniform, std=1/sqrt(n_embd)   (HMAP witten only)
             attn.c_proj:     zeros
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
             mlp.c_proj:      zeros
@@ -230,6 +496,10 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            # Witten potential projections (HMAP witten=True only): init like c_q/c_k
+            if block.attn.c_qw is not None:
+                torch.nn.init.uniform_(block.attn.c_qw.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_kw.weight, -s, s)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -327,6 +597,10 @@ class GPT(nn.Module):
         This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
+
+        NOTE: HMAP computes additional score matmuls (kinetic Gram + flux) that
+        this estimate does not account for, so reported MFU under-reads for HMAP
+        runs. Compare variants on loss-vs-step / loss-vs-wallclock, not MFU.
         """
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
@@ -420,6 +694,8 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
+        # (HMAP witten c_qw/c_kw live inside transformer.h, so they are matrix
+        #  params and get Muon treatment automatically — no changes needed.)
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
