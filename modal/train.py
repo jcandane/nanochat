@@ -538,6 +538,7 @@ else:
                 "PYTORCH_ALLOC_CONF": "expandable_segments:True",
                 "TORCHINDUCTOR_CACHE_DIR": f"{CACHE_DIR}/inductor_cache",
                 "TRITON_CACHE_DIR": f"{CACHE_DIR}/triton_cache",
+                "HF_XET_HIGH_PERFORMANCE": "1",
             }
         )
         .add_local_dir(
@@ -568,6 +569,7 @@ else:
         env["PYTHONPATH"] = (
             REPO_DIR if not existing else REPO_DIR + os.pathsep + existing
         )
+        env["PYTHONUNBUFFERED"] = "1"
         return env
 
 
@@ -575,8 +577,13 @@ else:
         cmd: list[str],
         *,
         log_path: Path | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         print("[modal/train] running:", " ".join(cmd), flush=True)
+
+        env = _subprocess_env()
+        if extra_env:
+            env.update(extra_env)
 
         log_handle = None
         if log_path is not None:
@@ -587,7 +594,7 @@ else:
             proc = subprocess.Popen(
                 cmd,
                 cwd=REPO_DIR,
-                env=_subprocess_env(),
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -728,18 +735,56 @@ else:
         )
 
 
-    def _next_run_id(repo_files: list[str], target_folder: str) -> str:
+    def _next_run_id(
+        repo_files: list[str],
+        target_folder: str,
+        *,
+        reserved_run_ids: list[str] | None = None,
+    ) -> str:
         pattern = re.compile(
             rf"^{re.escape(target_folder)}/run-(\d{{4,}})/"
         )
-        numbers = []
+        numbers: list[int] = []
         for filename in repo_files:
             match = pattern.match(filename)
             if match:
                 numbers.append(int(match.group(1)))
 
+        for run_id in reserved_run_ids or []:
+            match = re.fullmatch(r"run-(\d{4,})", run_id)
+            if match:
+                numbers.append(int(match.group(1)))
+
         next_number = max(numbers, default=0) + 1
         return f"run-{next_number:04d}"
+
+
+    def _pending_jobs_for_repo(hf_repo: str) -> list[dict[str, Any]]:
+        jobs_root = Path(CACHE_DIR) / "train_jobs"
+        if not jobs_root.is_dir():
+            return []
+
+        pending: list[dict[str, Any]] = []
+        for job_json in sorted(jobs_root.glob("*/job.json")):
+            try:
+                payload = json.loads(job_json.read_text())
+            except Exception as exc:
+                print(
+                    f"[modal/train] warning: unreadable pending job "
+                    f"{job_json}: {exc}",
+                    flush=True,
+                )
+                continue
+            if not isinstance(payload, dict):
+                continue
+            try:
+                payload_repo = _normalize_hf_repo_id(str(payload["hf_repo"]))
+            except Exception:
+                continue
+            if payload_repo == hf_repo:
+                payload["_job_json"] = str(job_json)
+                pending.append(payload)
+        return pending
 
 
     def _model_args_from_run_json(run_json: Path) -> dict[str, Any]:
@@ -896,7 +941,18 @@ else:
                 token=token,
             )
         )
-        target_run_id = _next_run_id(repo_files, target_folder)
+        pending_jobs = _pending_jobs_for_repo(hf_repo)
+        reserved_run_ids = [
+            str(job["target_run_id"])
+            for job in pending_jobs
+            if str(job.get("target_folder")) == target_folder
+            and job.get("target_run_id")
+        ]
+        target_run_id = _next_run_id(
+            repo_files,
+            target_folder,
+            reserved_run_ids=reserved_run_ids,
+        )
         target_prefix = f"{target_folder}/{target_run_id}/"
         if any(path.startswith(target_prefix) for path in repo_files):
             raise RuntimeError(
@@ -1090,6 +1146,193 @@ else:
         return job_payload
 
 
+    def _remote_target_status(
+        *,
+        api,
+        hf_repo: str,
+        revision: str,
+        token: str,
+        output_root: Path,
+        expected_paths: list[str],
+        target_prefix: str,
+    ) -> tuple[bool, list[str]]:
+        """Validate any existing partial publication for this pending job.
+
+        Returns ``(complete, existing_paths)``. Existing run/checkpoint JSON must
+        match byte-for-byte. An existing model must match local byte size. Any
+        unknown file under the reserved run prefix is treated as a collision.
+        """
+        repo_files = list(
+            api.list_repo_files(
+                repo_id=hf_repo,
+                repo_type="model",
+                revision=revision,
+                token=token,
+            )
+        )
+        existing = sorted(
+            path for path in repo_files if path.startswith(target_prefix)
+        )
+        if not existing:
+            return False, []
+
+        expected = set(expected_paths)
+        unknown = sorted(set(existing) - expected)
+        if unknown:
+            raise RuntimeError(
+                "reserved target run contains unexpected remote files; "
+                "refusing to overwrite:\n  " + "\n  ".join(unknown)
+            )
+
+        # Compare the small metadata files exactly.
+        from huggingface_hub import hf_hub_download
+
+        for remote_path in existing:
+            if not remote_path.endswith(".json"):
+                continue
+            local_path = output_root / Path(*PurePosixPath(remote_path).parts)
+            cached = hf_hub_download(
+                repo_id=hf_repo,
+                filename=remote_path,
+                repo_type="model",
+                revision=revision,
+                token=token,
+                cache_dir=f"{CACHE_DIR}/huggingface",
+                force_download=True,
+            )
+            if Path(cached).read_bytes() != local_path.read_bytes():
+                raise RuntimeError(
+                    f"remote partial publication conflicts with this pending "
+                    f"job: {remote_path}"
+                )
+
+        # For the giant model, avoid downloading it again. The path is reserved
+        # by this persisted pending job; matching byte size is sufficient to
+        # distinguish a completed/resumable upload from a conflicting artifact.
+        model_paths = [
+            path for path in existing if path.endswith("/model.safetensors")
+        ]
+        if model_paths:
+            infos = api.get_paths_info(
+                repo_id=hf_repo,
+                paths=model_paths,
+                repo_type="model",
+                revision=revision,
+                token=token,
+            )
+            info_by_path = {info.path: info for info in infos}
+            for remote_path in model_paths:
+                local_path = output_root / Path(*PurePosixPath(remote_path).parts)
+                info = info_by_path.get(remote_path)
+                remote_size = getattr(info, "size", None) if info else None
+                if remote_size != local_path.stat().st_size:
+                    raise RuntimeError(
+                        f"remote model size conflicts for {remote_path}: "
+                        f"remote={remote_size}, "
+                        f"local={local_path.stat().st_size}"
+                    )
+
+        return expected.issubset(existing), existing
+
+
+    def _upload_without_xet(
+        *,
+        hf_repo: str,
+        revision: str,
+        run_folder: Path,
+        path_in_repo: str,
+        commit_message: str,
+    ) -> None:
+        """Fallback upload in a fresh process with Xet explicitly disabled."""
+        code = r"""
+import os
+import sys
+from huggingface_hub import HfApi
+
+api = HfApi(token=os.environ["HF_TOKEN"])
+api.upload_folder(
+    repo_id=sys.argv[1],
+    repo_type="model",
+    revision=sys.argv[2],
+    token=os.environ["HF_TOKEN"],
+    folder_path=sys.argv[3],
+    path_in_repo=sys.argv[4],
+    commit_message=sys.argv[5],
+)
+"""
+        _run_streamed(
+            [
+                sys.executable,
+                "-c",
+                code,
+                hf_repo,
+                revision,
+                str(run_folder),
+                path_in_repo,
+                commit_message,
+            ],
+            extra_env={
+                "HF_HUB_DISABLE_XET": "1",
+                "HF_XET_HIGH_PERFORMANCE": "0",
+            },
+        )
+
+
+    @app.function(
+        image=image,
+        cpu=16,
+        memory=131072,
+        timeout=6 * 60 * 60,
+        retries=0,
+        scaledown_window=5,
+        volumes={CACHE_DIR: cache_volume},
+        secrets=[hf_secret],
+    )
+    def load_pending_job(
+        hf_repo: str,
+        pending_job: str = "latest",
+    ) -> dict[str, Any]:
+        """Load a completed-but-unpublished job from the persistent Volume."""
+        cache_volume.reload()
+        hf_repo = _normalize_hf_repo_id(hf_repo)
+        jobs = _pending_jobs_for_repo(hf_repo)
+        if not jobs:
+            raise RuntimeError(
+                f"no pending training jobs found for {hf_repo}"
+            )
+
+        if pending_job == "latest":
+            jobs.sort(
+                key=lambda job: Path(str(job["_job_json"])).stat().st_mtime,
+                reverse=True,
+            )
+            selected = jobs[0]
+        else:
+            matches = [
+                job
+                for job in jobs
+                if str(job.get("job_id")) == pending_job
+                or pending_job in str(job.get("job_id"))
+            ]
+            if len(matches) != 1:
+                names = [str(job.get("job_id")) for job in jobs]
+                raise RuntimeError(
+                    f"pending_job={pending_job!r} matched {len(matches)} jobs; "
+                    f"available={names}"
+                )
+            selected = matches[0]
+
+        selected = dict(selected)
+        selected.pop("_job_json", None)
+        print(
+            f"[modal/train] recovering pending job "
+            f"{selected.get('job_id')} -> "
+            f"{selected.get('target_folder')}/{selected.get('target_run_id')}",
+            flush=True,
+        )
+        return selected
+
+
     @app.function(
         image=image,
         cpu=16,
@@ -1116,26 +1359,6 @@ else:
         target_run_id = str(job["target_run_id"])
         steps = int(job["steps"])
         target_prefix = f"{target_folder}/{target_run_id}/"
-
-        # Re-check immediately before the one-and-only HF write. This protects
-        # against another process allocating the same run while training.
-        repo_files = list(
-            api.list_repo_files(
-                repo_id=hf_repo,
-                repo_type="model",
-                revision=str(job["revision"]),
-                token=token,
-            )
-        )
-        collisions = [
-            path for path in repo_files
-            if path.startswith(target_prefix)
-        ]
-        if collisions:
-            raise RuntimeError(
-                "target run appeared while training; refusing to overwrite:\n  "
-                + "\n  ".join(collisions[:20])
-            )
 
         for key in (
             "trained_model_pt",
@@ -1207,21 +1430,127 @@ else:
                 + "\n  ".join(local_files)
             )
 
-        # ONE Hugging Face commit, only now that training and canonicalization
-        # have both completed successfully.
-        api.upload_folder(
-            repo_id=hf_repo,
-            repo_type="model",
-            revision=str(job["revision"]),
-            token=token,
-            folder_path=str(run_folder),
-            path_in_repo=f"{target_folder}/{target_run_id}",
-            commit_message=(
-                f"{target_folder}/{target_run_id}: "
-                f"{job['source_checkpoint']} -> {job['target_arm']} "
-                f"for {steps} steps"
-            ),
+        revision = str(job["revision"])
+        expected_paths = [str(path) for path in publish_info["files"]]
+        target_path = f"{target_folder}/{target_run_id}"
+        commit_message = (
+            f"{target_folder}/{target_run_id}: "
+            f"{job['source_checkpoint']} -> {job['target_arm']} "
+            f"for {steps} steps"
         )
+
+        complete, existing = _remote_target_status(
+            api=api,
+            hf_repo=hf_repo,
+            revision=revision,
+            token=token,
+            output_root=output_root,
+            expected_paths=expected_paths,
+            target_prefix=target_prefix,
+        )
+        if complete:
+            print(
+                f"[modal/train] remote target is already complete; "
+                f"previous upload likely succeeded despite its client timeout: "
+                f"{target_path}",
+                flush=True,
+            )
+        else:
+            total_bytes = sum(
+                path.stat().st_size
+                for path in run_folder.rglob("*")
+                if path.is_file()
+            )
+            print(
+                f"[modal/train] publishing {total_bytes / 1024**3:.2f} GiB "
+                f"to {hf_repo}/{target_path}",
+                flush=True,
+            )
+            if existing:
+                print(
+                    "[modal/train] found matching partial publication; "
+                    "resuming it: " + ", ".join(existing),
+                    flush=True,
+                )
+
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    print(
+                        f"[modal/train] HF Xet upload attempt {attempt}/3...",
+                        flush=True,
+                    )
+                    api.upload_folder(
+                        repo_id=hf_repo,
+                        repo_type="model",
+                        revision=revision,
+                        token=token,
+                        folder_path=str(run_folder),
+                        path_in_repo=target_path,
+                        commit_message=commit_message,
+                    )
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    print(
+                        f"[modal/train] HF upload attempt {attempt} raised "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+
+                    # The server may have accepted the commit even though the
+                    # client timed out waiting for the response.
+                    complete, _ = _remote_target_status(
+                        api=api,
+                        hf_repo=hf_repo,
+                        revision=revision,
+                        token=token,
+                        output_root=output_root,
+                        expected_paths=expected_paths,
+                        target_prefix=target_prefix,
+                    )
+                    if complete:
+                        print(
+                            "[modal/train] remote target is complete despite "
+                            "the client-side upload exception",
+                            flush=True,
+                        )
+                        last_error = None
+                        break
+
+                    if attempt < 3:
+                        import time
+                        time.sleep(5 * attempt)
+
+            if last_error is not None:
+                print(
+                    "[modal/train] repeated Xet failures; retrying the same "
+                    "completed checkpoint with HF_HUB_DISABLE_XET=1",
+                    flush=True,
+                )
+                _upload_without_xet(
+                    hf_repo=hf_repo,
+                    revision=revision,
+                    run_folder=run_folder,
+                    path_in_repo=target_path,
+                    commit_message=commit_message,
+                )
+
+            complete, existing = _remote_target_status(
+                api=api,
+                hf_repo=hf_repo,
+                revision=revision,
+                token=token,
+                output_root=output_root,
+                expected_paths=expected_paths,
+                target_prefix=target_prefix,
+            )
+            if not complete:
+                raise RuntimeError(
+                    "HF upload returned without error but the canonical target "
+                    f"is incomplete: {existing}"
+                )
 
         print(
             f"[modal/train] published canonical run: "
@@ -1261,17 +1590,36 @@ else:
     @app.local_entrypoint()
     def main(
         hf_repo: str,
-        source_checkpoint: str,
-        target_arm: str,
+        mode: str = "train",
+        source_checkpoint: str = "",
+        target_arm: str = "",
         steps: int = 20,
         gpu: str = "H100",
         num_gpus: int = 1,
         device_batch_size: int = 1,
-        total_batch_size: int = -1,
+        total_batch_size: int = 2048,
         data_shards: int = 240,
         revision: str = "main",
+        pending_job: str = "latest",
     ) -> None:
-        """GitHub/local entrypoint: GPU train first, CPU publish second."""
+        """Train a new run, or recover publication of a completed pending job."""
+        mode = mode.strip().lower()
+        if mode not in {"train", "recover"}:
+            raise ValueError("mode must be 'train' or 'recover'")
+
+        if mode == "recover":
+            pending = load_pending_job.remote(
+                hf_repo=hf_repo,
+                pending_job=pending_job,
+            )
+            result = publish_run.remote(pending)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return
+
+        if not source_checkpoint.strip():
+            raise ValueError("source_checkpoint is required in train mode")
+        if not target_arm.strip():
+            raise ValueError("target_arm is required in train mode")
         if num_gpus not in {1, 2, 4, 8}:
             raise ValueError("num_gpus must be one of 1, 2, 4, 8")
 
@@ -1281,7 +1629,6 @@ else:
             flush=True,
         )
 
-        # Dynamic GPU options let one generic workflow choose 1/2/4/8 GPUs.
         trained = train_run.with_options(gpu=gpu_request).remote(
             hf_repo=hf_repo,
             source_checkpoint=source_checkpoint,
@@ -1295,6 +1642,5 @@ else:
             git_commit=os.environ.get("GITHUB_SHA", ""),
         )
 
-        # This call cannot happen unless the GPU function returned successfully.
         result = publish_run.remote(trained)
         print(json.dumps(result, indent=2, sort_keys=True))
