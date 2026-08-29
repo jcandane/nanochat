@@ -543,9 +543,16 @@ else:
         create_if_missing=True,
     )
 
-    # GitHub Actions exposes HF_TOKEN to `modal run`; this copies it into the
-    # remote function without creating a separately named Modal Secret.
-    hf_secret = modal.Secret.from_local_environ(["HF_TOKEN"])
+    # This module is evaluated both by the local Modal client and again in the
+    # remote container. Build the real ephemeral Secret only on the local side;
+    # in remote execution keep an empty placeholder. This is the pattern Modal
+    # recommends for secrets sourced from the caller's environment.
+    if modal.is_local():
+        hf_secret = modal.Secret.from_dict(
+            {"HF_TOKEN": os.environ.get("HF_TOKEN")}
+        )
+    else:
+        hf_secret = modal.Secret.from_dict({})
 
     image = (
         modal.Image.debian_slim(python_version="3.11")
@@ -623,6 +630,28 @@ else:
         )
 
 
+    def _normalize_hf_repo_id(value: str) -> str:
+        """Accept either ``owner/repo`` or ``https://huggingface.co/owner/repo``."""
+        repo_id = value.strip().rstrip("/")
+        prefix = "https://huggingface.co/"
+        if repo_id.startswith(prefix):
+            repo_id = repo_id[len(prefix):]
+        if repo_id.startswith("http://huggingface.co/"):
+            repo_id = repo_id[len("http://huggingface.co/"):]
+        if repo_id.startswith("models/"):
+            repo_id = repo_id[len("models/"):]
+        if repo_id.endswith(".git"):
+            repo_id = repo_id[:-4]
+
+        parts = [part for part in repo_id.split("/") if part]
+        if len(parts) != 2:
+            raise ValueError(
+                "HF_REPO must be a model repo id like 'owner/repo' "
+                "or 'https://huggingface.co/owner/repo'"
+            )
+        return "/".join(parts)
+
+
     def _target_paths(run_id: str) -> tuple[str, str, str]:
         base = f"attention/{run_id}"
         checkpoint = f"{base}/checkpoints/step-000000"
@@ -651,6 +680,7 @@ else:
         """Convert and upload Karpathy d32 as attention/<run>/step-000000."""
         if not hf_repo.strip():
             raise ValueError("hf_repo must be non-empty")
+        hf_repo = _normalize_hf_repo_id(hf_repo)
 
         token = os.environ.get("HF_TOKEN") or None
         if token is None:
@@ -663,13 +693,23 @@ else:
 
         api = HfApi(token=token)
 
-        # Fail early if HF_REPO is wrong rather than accidentally creating a
-        # public repository or uploading somewhere unintended.
-        api.repo_info(
-            repo_id=hf_repo,
-            repo_type="model",
-            token=token,
-        )
+        # Fail early if HF_REPO is wrong or the supplied token cannot access it.
+        # Hugging Face intentionally uses RepositoryNotFoundError for both a
+        # nonexistent repo and an inaccessible private repo.
+        try:
+            api.repo_info(
+                repo_id=hf_repo,
+                repo_type="model",
+                token=token,
+            )
+        except Exception as exc:
+            if exc.__class__.__name__ == "RepositoryNotFoundError":
+                raise RuntimeError(
+                    "HF_REPO could not be accessed. Check that the repo exists, "
+                    "HF_REPO is 'owner/repo' (or its Hugging Face URL), and "
+                    "HF_TOKEN has write access to that private/model repo."
+                ) from exc
+            raise
 
         existing = set(
             api.list_repo_files(
