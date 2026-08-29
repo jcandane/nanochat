@@ -12,10 +12,10 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 
 Attention-variant arms (operator square, see nanochat/gpt.py docstring):
 
-    python -m scripts.base_train --arm=amap ...        # (b,a)=(0,0)
-    python -m scripts.base_train --arm=dmap ...        # (b,a)=(0,1)
-    python -m scripts.base_train --arm=hmap ...        # (b,a)=(1,1)
-    python -m scripts.base_train --arm=attention ...   # standard FA3 path (control)
+    python -m scripts.base_train --arm=dmap ...        # (b,a)=(0,0), most constrained
+    python -m scripts.base_train --arm=amap ...        # (b,a)=(0,1), PSD + flux
+    python -m scripts.base_train --arm=hmap ...        # (b,a)=(1,0), indefinite + Doob
+    python -m scripts.base_train --arm=attention ...   # (b,a)=(1,1), standard FA3 control
 
 or with explicit coordinates for square sweeps:
 
@@ -80,9 +80,9 @@ parser.add_argument("--arm", type=str, default="", choices=["", "attention", "am
 parser.add_argument("--attn-variant", type=str, default="standard", choices=["standard", "hmap"],
                     help="attention mechanism: 'standard' (Karpathy FA3 path) or 'hmap' (eager operator square)")
 parser.add_argument("--hmap-alpha", type=float, default=None,
-                    help="exactness coordinate a in [0,1]: 0=flux face, 1=Doob-potential face (default 0.0)")
+                    help="exactness-release coordinate a in [0,1]: 0=Doob/exact face, 1=flux face (default 0.0)")
 parser.add_argument("--hmap-beta", type=float, default=None,
-                    help="kinetic signature coordinate b in [0,1]: 0=PSD kinetic, 1=full indefinite kernel (default 0.0)")
+                    help="signature-release coordinate b in [0,1]: 0=PSD kinetic, 1=full indefinite kernel (default 0.0)")
 parser.add_argument("--witten", action="store_true",
                     help="add the independent learned Witten potential (two extra Linears per attention block; "
                          "CHANGES parameter count — breaks key-for-key grafts with witten=False checkpoints)")
@@ -126,7 +126,7 @@ if args.arm:
         assert args.attn_variant in ("standard",), \
             "--arm=attention runs the standard FA3 path; do not combine with --attn-variant=hmap"
         args.attn_variant = "standard"
-        # Recorded for provenance; unused by the standard path. (1,0) is the
+        # Recorded for provenance; unused by the standard path. (1,1) is the
         # attention corner of the square, certified equivalent in tests.
         args.hmap_beta, args.hmap_alpha = HMAP_ARMS["attention"]
     else:
@@ -171,7 +171,7 @@ if args.attn_variant == "hmap":
     b, a = args.hmap_beta, args.hmap_alpha
     arm_name = args.arm if args.arm else f"(b={b:g}, a={a:g})"
     print0(f"Attention variant: hmap {arm_name} | eager explicit-logits path (no FA3 in attention)")
-    print0(f"  operator: 1/2<m,m> - {b:g}*1/2<n,n> + {1.0-a:g}*1/2(<q,k>-<k,q>) + {a:g}*1/2(g_i - g_j), g=1/2||m||^2 - {b:g}*1/2||n||^2")
+    print0(f"  operator: 1/2<m,m> - {b:g}*1/2<n,n> + {a:g}*1/2(<q,k>-<k,q>) + {1.0-a:g}*1/2(g_i - g_j), g=1/2||m||^2 - {b:g}*1/2||n||^2")
     if args.witten:
         print0("  witten=True: independent learned potential enabled (parameter count differs from witten=False checkpoints)")
     if args.window_pattern != "L":
