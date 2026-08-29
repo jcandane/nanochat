@@ -1,0 +1,76 @@
+# .github/workflows/initialize.yml
+name: Initialize canonical d32 checkpoint
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Target attention run id"
+        required: true
+        default: "run-0001"
+        type: string
+
+      force:
+        description: "Overwrite an existing attention/run checkpoint"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  initialize:
+    name: "Bootstrap Karpathy d32 -> attention/${{ inputs.run_id }}/step-000000"
+    runs-on: ubuntu-latest
+    timeout-minutes: 390
+
+    env:
+      HF_REPO: ${{ secrets.HF_REPO }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify required repository secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in HF_REPO HF_TOKEN MODAL_TOKEN_ID MODAL_TOKEN_SECRET; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required repository secret '$name' is not configured."
+              exit 1
+            fi
+          done
+
+      - name: Install Modal CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade modal
+
+      - name: Import Karpathy d32 into canonical attention checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=(
+            modal run modal/initialize.py
+            --hf-repo "$HF_REPO"
+            --run-id "${{ inputs.run_id }}"
+          )
+
+          if [[ "${{ inputs.force }}" == "true" ]]; then
+            args+=(--force)
+          fi
+
+          "${args[@]}"
