@@ -45,7 +45,19 @@ if _RUNTIME:
     # -------------------------------------------------------------------------
     # Inner conversion runtime. Executed with /root/nanochat/.venv/bin/python.
     # Avoid importing Modal here.
+    #
+    # Because this file is executed directly from ``modal/initialize.py``,
+    # Python would otherwise put only ``.../modal`` at sys.path[0]. Add the
+    # repository root explicitly so ``experiments`` and ``nanochat`` are
+    # importable without turning the repo's ``modal/`` directory into a Python
+    # package (which would shadow the installed Modal SDK).
     # -------------------------------------------------------------------------
+    from pathlib import Path as _BootstrapPath
+
+    _REPO_ROOT = _BootstrapPath(__file__).resolve().parents[1]
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+
     import argparse
     from dataclasses import asdict, fields
     from datetime import datetime, timezone
@@ -597,9 +609,18 @@ else:
 
     def _run_streamed(cmd: list[str]) -> None:
         print("[initialize] running:", " ".join(cmd), flush=True)
+        env = os.environ.copy()
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            REPO_DIR
+            if not existing_pythonpath
+            else REPO_DIR + os.pathsep + existing_pythonpath
+        )
+
         proc = subprocess.Popen(
             cmd,
             cwd=REPO_DIR,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
