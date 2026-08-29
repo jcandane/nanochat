@@ -112,7 +112,14 @@ image = (
             "wandb",
         ],
     )
-    .run_commands(f"cd {REPO_DIR} && uv sync --extra gpu")
+    .run_commands(
+        f"cd {REPO_DIR} && uv sync --extra gpu",
+        (
+            f"uv pip install --python {VENV}/bin/python safetensors "
+            f"&& {VENV}/bin/python -c \"import safetensors; "
+            "print('safetensors', safetensors.__version__)\""
+        ),
+    )
 )
 
 
@@ -120,9 +127,13 @@ def _run_streamed(cmd: list[str]) -> None:
     """Run a subprocess in the repo venv while streaming logs to Modal."""
     print("[modal/induction] running:", " ".join(cmd), flush=True)
 
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
     proc = subprocess.Popen(
         cmd,
         cwd=REPO_DIR,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
