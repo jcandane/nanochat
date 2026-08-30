@@ -48,9 +48,20 @@ _RUNTIME = "--runtime" in sys.argv
 
 if _RUNTIME:
     # ---------------------------------------------------------------------
-    # Inner helper runtime. This executes under the repo uv venv, where torch,
-    # safetensors, nanochat, and experiments are installed.
+    # Inner helper runtime. This executes under the repo uv venv.
+    #
+    # This file is invoked directly as:
+    #   python /root/nanochat/modal/simulation.py --runtime ...
+    # Direct-file execution makes sys.path[0] == /root/nanochat/modal, so the
+    # repo-root packages ``experiments`` and ``nanochat`` are otherwise not
+    # importable. Bootstrap the repository root before importing either.
     # ---------------------------------------------------------------------
+    from pathlib import Path as _BootstrapPath
+
+    _REPO_ROOT = _BootstrapPath(__file__).resolve().parents[1]
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+
     import argparse
     from dataclasses import asdict, replace
     import hashlib
