@@ -1,0 +1,244 @@
+# .github/workflows/simulation.yml
+name: Run or recover operator-square simulation
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "train = new continuous trajectory; recover = resume/publish a pending one"
+        required: true
+        default: "train"
+        type: choice
+        options:
+          - train
+          - recover
+
+      source_checkpoint:
+        description: "Canonical untouched source weights"
+        required: true
+        default: "attention/run-0001/checkpoints/step-000000"
+        type: string
+
+      arm:
+        description: "Operator used for the entire trajectory"
+        required: true
+        default: "hmap"
+        type: choice
+        options:
+          - attention
+          - amap
+          - hmap
+          - dmap
+
+      horizon:
+        description: "Fixed optimizer/LR-schedule horizon"
+        required: true
+        default: "10000"
+        type: string
+
+      milestone_every:
+        description: "Pause for BPB + CORE + induction/DAC every N optimizer steps"
+        required: true
+        default: "1000"
+        type: string
+
+      pending_job:
+        description: "Recover mode: latest or a simulation job-id substring"
+        required: true
+        default: "latest"
+        type: string
+
+      gpu:
+        description: "Modal GPU type"
+        required: true
+        default: "H100"
+        type: choice
+        options:
+          - H100
+          - H200
+          - B200
+          - A100-80GB
+
+      num_gpus:
+        description: "GPUs in the simulation container"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "8"
+
+      device_batch_size:
+        description: "Per-device sequence batch"
+        required: true
+        default: "1"
+        type: string
+
+      total_batch_size:
+        description: "Scientific optimizer batch in tokens"
+        required: true
+        default: "16384"
+        type: string
+
+      data_shards:
+        description: "nanochat pretraining shards"
+        required: true
+        default: "240"
+        type: string
+
+      eval_tokens:
+        description: "Validation BPB token budget at each milestone"
+        required: true
+        default: "4194304"
+        type: string
+
+      core_max_per_task:
+        description: "CORE examples per task at each milestone"
+        required: true
+        default: "500"
+        type: string
+
+      induction_lengths:
+        description: "Repeated-random half-lengths"
+        required: true
+        default: "32,64,128,256,512"
+        type: string
+
+      induction_offsets:
+        description: "DAC induction-edge offsets"
+        required: true
+        default: "-2,-1,0,1,2"
+        type: string
+
+      induction_num_batches:
+        description: "Logical induction batches per length"
+        required: true
+        default: "4"
+        type: string
+
+      induction_seed:
+        description: "Fixed induction benchmark seed"
+        required: true
+        default: "1234"
+        type: string
+
+      revision:
+        description: "HF_REPO branch/revision"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+# A pending job reserves its run id on the Modal volume. Serialize simulations
+# within one arm while allowing different arms to run independently if desired.
+concurrency:
+  group: operator-square-simulation-${{ inputs.arm }}
+  cancel-in-progress: false
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      HF_REPO: ${{ secrets.HF_REPO }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify required repository secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in HF_REPO HF_TOKEN MODAL_TOKEN_ID MODAL_TOKEN_SECRET; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required repository secret '$name' is not configured."
+              exit 1
+            fi
+          done
+
+      - name: Validate inputs
+        shell: bash
+        env:
+          HORIZON: ${{ inputs.horizon }}
+          MILESTONE_EVERY: ${{ inputs.milestone_every }}
+          NUM_GPUS: ${{ inputs.num_gpus }}
+          DEVICE_BATCH_SIZE: ${{ inputs.device_batch_size }}
+          TOTAL_BATCH_SIZE: ${{ inputs.total_batch_size }}
+          DATA_SHARDS: ${{ inputs.data_shards }}
+          EVAL_TOKENS: ${{ inputs.eval_tokens }}
+          CORE_MAX_PER_TASK: ${{ inputs.core_max_per_task }}
+          INDUCTION_NUM_BATCHES: ${{ inputs.induction_num_batches }}
+          INDUCTION_SEED: ${{ inputs.induction_seed }}
+        run: |
+          set -euo pipefail
+          for pair in \
+            "horizon:$HORIZON" \
+            "milestone_every:$MILESTONE_EVERY" \
+            "device_batch_size:$DEVICE_BATCH_SIZE" \
+            "total_batch_size:$TOTAL_BATCH_SIZE" \
+            "data_shards:$DATA_SHARDS" \
+            "eval_tokens:$EVAL_TOKENS" \
+            "core_max_per_task:$CORE_MAX_PER_TASK" \
+            "induction_num_batches:$INDUCTION_NUM_BATCHES"; do
+            name="${pair%%:*}"
+            value="${pair#*:}"
+            [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+              echo "::error::$name must be a positive integer"; exit 1;
+            }
+          done
+          [[ "$NUM_GPUS" =~ ^(1|2|4|8)$ ]] || {
+            echo "::error::num_gpus must be 1, 2, 4, or 8"; exit 1;
+          }
+          (( HORIZON % MILESTONE_EVERY == 0 )) || {
+            echo "::error::milestone_every must divide horizon exactly"; exit 1;
+          }
+          [[ "$INDUCTION_SEED" =~ ^-?[0-9]+$ ]] || {
+            echo "::error::induction_seed must be an integer"; exit 1;
+          }
+
+      - name: Install Modal CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade modal huggingface_hub
+
+      - name: Run or recover simulation on Modal
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          modal run modal/simulation.py \
+            --hf-repo "$HF_REPO" \
+            --mode "${{ inputs.mode }}" \
+            --source-checkpoint "${{ inputs.source_checkpoint }}" \
+            --arm "${{ inputs.arm }}" \
+            --horizon "${{ inputs.horizon }}" \
+            --milestone-every "${{ inputs.milestone_every }}" \
+            --pending-job "${{ inputs.pending_job }}" \
+            --gpu "${{ inputs.gpu }}" \
+            --num-gpus "${{ inputs.num_gpus }}" \
+            --device-batch-size "${{ inputs.device_batch_size }}" \
+            --total-batch-size "${{ inputs.total_batch_size }}" \
+            --data-shards "${{ inputs.data_shards }}" \
+            --eval-tokens "${{ inputs.eval_tokens }}" \
+            --core-max-per-task "${{ inputs.core_max_per_task }}" \
+            --induction-lengths "${{ inputs.induction_lengths }}" \
+            --induction-offsets="${{ inputs.induction_offsets }}" \
+            --induction-num-batches "${{ inputs.induction_num_batches }}" \
+            --induction-seed "${{ inputs.induction_seed }}" \
+            --revision "${{ inputs.revision }}"
