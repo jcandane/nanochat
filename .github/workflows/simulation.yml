@@ -109,6 +109,12 @@ on:
         default: "524288"
         type: string
 
+      learning_rate_multiplier:
+        description: "Global multiplier on nanochat LR groups (1.0 = defaults; matrix LR 0.02 before batch scaling)"
+        required: true
+        default: "1.0"
+        type: string
+
       data_shards:
         description: "nanochat pretraining shards"
         required: true
@@ -208,6 +214,7 @@ jobs:
           NUM_GPUS: ${{ inputs.num_gpus }}
           DEVICE_BATCH_SIZE: ${{ inputs.device_batch_size }}
           TOTAL_BATCH_SIZE: ${{ inputs.total_batch_size }}
+          LEARNING_RATE_MULTIPLIER: ${{ inputs.learning_rate_multiplier }}
           DATA_SHARDS: ${{ inputs.data_shards }}
           EVAL_TOKENS: ${{ inputs.eval_tokens }}
           CORE_MAX_PER_TASK: ${{ inputs.core_max_per_task }}
@@ -239,6 +246,22 @@ jobs:
           [[ "$INDUCTION_SEED" =~ ^-?[0-9]+$ ]] || {
             echo "::error::induction_seed must be an integer"; exit 1;
           }
+
+          python - "$LEARNING_RATE_MULTIPLIER" <<'PY'
+          import math
+          import sys
+          value = float(sys.argv[1])
+          if not math.isfinite(value) or value <= 0:
+              raise SystemExit("learning_rate_multiplier must be finite and > 0")
+          print(
+              "::notice::LR multiplier="
+              f"{value:g}; pre-batch-scale LRs: "
+              f"embedding={0.3*value:g}, "
+              f"unembedding={0.008*value:g}, "
+              f"matrix={0.02*value:g}, "
+              f"scalar={0.5*value:g}"
+          )
+          PY
 
           # --- Token-budget guard -------------------------------------------
           # total_batch_size must be a multiple of num_gpus*device_batch_size*2048
@@ -300,6 +323,7 @@ jobs:
             --num-gpus "${{ inputs.num_gpus }}" \
             --device-batch-size "${{ inputs.device_batch_size }}" \
             --total-batch-size "${{ inputs.total_batch_size }}" \
+            --learning-rate-multiplier "${{ inputs.learning_rate_multiplier }}" \
             --data-shards "${{ inputs.data_shards }}" \
             --eval-tokens "${{ inputs.eval_tokens }}" \
             --core-max-per-task "${{ inputs.core_max_per_task }}" \
