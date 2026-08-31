@@ -1,6 +1,29 @@
 # .github/workflows/simulation.yml
 name: Run or recover operator-square simulation
 
+# ---------------------------------------------------------------------------
+# Graft DAG (all arms share one parameter vector; every graft is a pure
+# operator swap on identical weights):
+#
+#     attention (untouched d32)  ──►  amap
+#     attention (untouched d32)  ──►  hmap
+#     amap  (adapted checkpoint) ──►  dmap
+#
+# attention → attention is the fine-tune / drift control.
+# The DAG is enforced in "Validate inputs" below.
+#
+# Token budget: the scientific batch is nanochat's 524,288 tokens per
+# optimizer step (LR scale = 1, Karpathy's schedule verbatim). With
+# horizon=3000 that is ~1.57B tokens per arm — the budget of the original
+# AMAP-3000 result. Do NOT lower total_batch_size to fit a small GPU: the
+# base_train LR scaling (sqrt(B/B_ref)) will silently starve the run.
+# Lower device_batch_size instead (gradient accumulation compensates).
+#
+# Eager path memory (d32: 16 heads, T=2048, 32 layers): device_batch_size=4
+# is the expected ceiling on an 80GB H100; smoke-test 10 steps first and
+# fall back to 2 if it OOMs.
+# ---------------------------------------------------------------------------
+
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +37,11 @@ on:
           - recover
 
       source_checkpoint:
-        description: "Canonical untouched source weights"
+        description: >-
+          Source weights (HF path). attention/amap/hmap arms graft from the
+          untouched source attention/run-0001/checkpoints/step-000000;
+          the dmap arm grafts from an adapted AMAP checkpoint, e.g.
+          AMAP/run-0003/checkpoints/step-003000.
         required: true
         default: "attention/run-0001/checkpoints/step-000000"
         type: string
@@ -22,7 +49,7 @@ on:
       arm:
         description: "Operator used for the entire trajectory"
         required: true
-        default: "hmap"
+        default: "amap"
         type: choice
         options:
           - attention
@@ -31,15 +58,15 @@ on:
           - dmap
 
       horizon:
-        description: "Fixed optimizer/LR-schedule horizon"
+        description: "Fixed optimizer/LR-schedule horizon (steps at total_batch_size tokens each)"
         required: true
-        default: "10000"
+        default: "3000"
         type: string
 
       milestone_every:
         description: "Pause for BPB + CORE + induction/DAC every N optimizer steps"
         required: true
-        default: "1000"
+        default: "250"
         type: string
 
       pending_job:
@@ -62,7 +89,7 @@ on:
       num_gpus:
         description: "GPUs in the simulation container"
         required: true
-        default: "1"
+        default: "8"
         type: choice
         options:
           - "1"
@@ -71,15 +98,15 @@ on:
           - "8"
 
       device_batch_size:
-        description: "Per-device sequence batch"
+        description: "Per-device sequence batch (eager attention: 4 on H100-80GB; use 2 if OOM)"
         required: true
-        default: "1"
+        default: "4"
         type: string
 
       total_batch_size:
-        description: "Scientific optimizer batch in tokens"
+        description: "Scientific optimizer batch in tokens (nanochat reference: 524288)"
         required: true
-        default: "16384"
+        default: "524288"
         type: string
 
       data_shards:
@@ -173,6 +200,9 @@ jobs:
       - name: Validate inputs
         shell: bash
         env:
+          MODE: ${{ inputs.mode }}
+          ARM: ${{ inputs.arm }}
+          SOURCE_CHECKPOINT: ${{ inputs.source_checkpoint }}
           HORIZON: ${{ inputs.horizon }}
           MILESTONE_EVERY: ${{ inputs.milestone_every }}
           NUM_GPUS: ${{ inputs.num_gpus }}
@@ -209,6 +239,42 @@ jobs:
           [[ "$INDUCTION_SEED" =~ ^-?[0-9]+$ ]] || {
             echo "::error::induction_seed must be an integer"; exit 1;
           }
+
+          # --- Token-budget guard -------------------------------------------
+          # total_batch_size must be a multiple of num_gpus*device_batch_size*2048
+          # (gradient accumulation), and we refuse starved recipes.
+          seq_len=2048
+          micro=$(( NUM_GPUS * DEVICE_BATCH_SIZE * seq_len ))
+          (( TOTAL_BATCH_SIZE % micro == 0 )) || {
+            echo "::error::total_batch_size ($TOTAL_BATCH_SIZE) must be a multiple of num_gpus*device_batch_size*2048 = $micro"; exit 1;
+          }
+          if (( TOTAL_BATCH_SIZE < 262144 )); then
+            echo "::error::total_batch_size=$TOTAL_BATCH_SIZE is below 262144 tokens; the base_train LR scaling sqrt(B/B_ref) will starve the run. Use 524288 (nanochat reference)."; exit 1
+          fi
+          tokens=$(( TOTAL_BATCH_SIZE * HORIZON ))
+          echo "::notice::Token budget for this arm: $tokens tokens ($HORIZON steps x $TOTAL_BATCH_SIZE)"
+
+          # --- Graft DAG guard (train mode only) -----------------------------
+          # attention / amap / hmap graft from the untouched source;
+          # dmap grafts from an adapted AMAP checkpoint.
+          if [[ "$MODE" == "train" ]]; then
+            case "$ARM" in
+              attention|amap|hmap)
+                [[ "$SOURCE_CHECKPOINT" == attention/* ]] || {
+                  echo "::error::arm=$ARM must graft from an attention/* source (untouched d32); got '$SOURCE_CHECKPOINT'"; exit 1;
+                }
+                ;;
+              dmap)
+                [[ "$SOURCE_CHECKPOINT" == AMAP/* || "$SOURCE_CHECKPOINT" == amap/* ]] || {
+                  echo "::error::arm=dmap must graft from an adapted AMAP checkpoint (AMAP/run-XXXX/checkpoints/step-NNNNNN); got '$SOURCE_CHECKPOINT'"; exit 1;
+                }
+                [[ "$SOURCE_CHECKPOINT" != */step-000000 ]] || {
+                  echo "::error::arm=dmap source must be an ADAPTED AMAP checkpoint, not step-000000"; exit 1;
+                }
+                ;;
+            esac
+            echo "::notice::Graft: $SOURCE_CHECKPOINT --> arm=$ARM"
+          fi
 
       - name: Install Modal CLI
         shell: bash
