@@ -613,6 +613,36 @@ else:
         return files
 
 
+    def _remote_file_exists(
+        *,
+        repo_id: str,
+        filename: str,
+        revision: str,
+        token: str,
+    ) -> bool:
+        """Direct tiny-file HF probe used as an immutable run-id collision guard."""
+        from huggingface_hub import hf_hub_download
+
+        try:
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type="model",
+                revision=revision,
+                token=token,
+                cache_dir=f"{CACHE_DIR}/huggingface",
+            )
+            return True
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if type(exc).__name__ in {
+                "EntryNotFoundError",
+                "RemoteEntryNotFoundError",
+            } or status == 404:
+                return False
+            raise
+
+
     def _ensure_tokenizer() -> None:
         destination_root = Path(CACHE_DIR) / "tokenizer"
         for name in TOKENIZER_FILES:
@@ -884,11 +914,22 @@ if args.stop_after_step >= 0:
 
         if num_gpus == 1:
             return [f"{VENV}/bin/python", *args]
+
+        # torchrun has its own argparse options (including --run-path).
+        # Without an explicit "--" separator, a trainer flag such as
+        # "--run=dummy" is consumed by torchrun and becomes ambiguous with
+        # --run-path.  Keep "-m <module>" on the torchrun side, then terminate
+        # torchrun option parsing before forwarding the trainer arguments.
+        if len(args) < 2 or args[0] != "-m" or args[1] != trainer_module:
+            raise RuntimeError("internal trainer argv layout changed")
         return [
             f"{VENV}/bin/torchrun",
             "--standalone",
             f"--nproc_per_node={num_gpus}",
-            *args,
+            "-m",
+            trainer_module,
+            "--",
+            *args[2:],
         ]
 
 
@@ -1136,6 +1177,33 @@ if args.stop_after_step >= 0:
                 folder=target_folder,
                 reserved=reserved,
             )
+
+            # Never trust repository listing alone for immutable run allocation.
+            # Probe the tiny canonical run.json directly and keep incrementing
+            # until the target prefix is genuinely unused.
+            while _remote_file_exists(
+                repo_id=hf_repo,
+                filename=f"{target_folder}/{target_run_id}/run.json",
+                revision=revision,
+                token=token,
+            ):
+                print(
+                    f"[modal/simulation] {target_folder}/{target_run_id} "
+                    "already exists remotely; allocating the next run id",
+                    flush=True,
+                )
+                run_number = int(target_run_id.split("-", 1)[1]) + 1
+                target_run_id = f"run-{run_number:04d}"
+
+            if any(
+                path.startswith(f"{target_folder}/{target_run_id}/")
+                for path in remote_files
+            ):
+                raise RuntimeError(
+                    "internal run-id allocator selected an existing HF prefix: "
+                    f"{target_folder}/{target_run_id}"
+                )
+
             job_id = (
                 f"simulation-{target_arm}-{target_run_id}-{uuid.uuid4().hex[:10]}"
             )
