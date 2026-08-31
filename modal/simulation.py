@@ -162,6 +162,7 @@ if _RUNTIME:
         milestone_every: int,
         total_batch_size: int,
         device_batch_size: int,
+        learning_rate_multiplier: float,
         data_shards: int,
         git_commit: str,
         output_run_json: Path,
@@ -198,6 +199,14 @@ if _RUNTIME:
             "optimizer_steps": horizon,
             "total_batch_size": total_batch_size,
             "device_batch_size": device_batch_size,
+            "learning_rate_multiplier": learning_rate_multiplier,
+            "optimizer_learning_rates_before_batch_scale": {
+                "embedding_lr": 0.3 * learning_rate_multiplier,
+                "unembedding_lr": 0.008 * learning_rate_multiplier,
+                "matrix_lr": 0.02 * learning_rate_multiplier,
+                "scalar_lr": 0.5 * learning_rate_multiplier,
+            },
+            "batch_lr_scale_reference_tokens": 524288,
             "data_shards": data_shards,
             "intermediate_checkpoint_policy": "rolling_modal_volume",
             "hf_checkpoint_policy": "final_only_after_full_success",
@@ -320,6 +329,7 @@ if _RUNTIME:
         command.add_argument("--milestone-every", type=int, required=True)
         command.add_argument("--total-batch-size", type=int, required=True)
         command.add_argument("--device-batch-size", type=int, required=True)
+        command.add_argument("--learning-rate-multiplier", type=float, required=True)
         command.add_argument("--data-shards", type=int, required=True)
         command.add_argument("--git-commit", default="")
         command.add_argument("--output-run-json", required=True)
@@ -356,6 +366,7 @@ if _RUNTIME:
                 milestone_every=args.milestone_every,
                 total_batch_size=args.total_batch_size,
                 device_batch_size=args.device_batch_size,
+                learning_rate_multiplier=args.learning_rate_multiplier,
                 data_shards=args.data_shards,
                 git_commit=args.git_commit,
                 output_run_json=Path(args.output_run_json),
@@ -388,6 +399,7 @@ else:
     # repo venv or the base_train subprocess.
     # ---------------------------------------------------------------------
     import json
+    import math
     import os
     from pathlib import Path, PurePosixPath
     import re
@@ -885,6 +897,7 @@ if args.stop_after_step >= 0:
         num_gpus: int,
         device_batch_size: int,
         total_batch_size: int,
+        learning_rate_multiplier: float,
     ) -> list[str]:
         args = [
             "-m",
@@ -906,6 +919,13 @@ if args.stop_after_step >= 0:
             "--sample-every=-1",
             f"--device-batch-size={device_batch_size}",
             f"--total-batch-size={total_batch_size}",
+            # One scientific LR knob, preserving nanochat's optimizer-group ratios.
+            # base_train applies its sqrt(batch/B_ref) scaling and step schedule
+            # AFTER these values are supplied.
+            f"--embedding-lr={0.3 * learning_rate_multiplier:.12g}",
+            f"--unembedding-lr={0.008 * learning_rate_multiplier:.12g}",
+            f"--matrix-lr={0.02 * learning_rate_multiplier:.12g}",
+            f"--scalar-lr={0.5 * learning_rate_multiplier:.12g}",
         ]
         if resume_from_step > 0:
             args.append(f"--resume-from-step={resume_from_step}")
@@ -1094,6 +1114,7 @@ if args.stop_after_step >= 0:
         num_gpus: int = 1,
         device_batch_size: int = 1,
         total_batch_size: int = 16_384,
+        learning_rate_multiplier: float = 1.0,
         data_shards: int = 240,
         eval_tokens: int = 4_194_304,
         core_max_per_task: int = 500,
@@ -1117,6 +1138,11 @@ if args.stop_after_step >= 0:
             raise ValueError("num_gpus must be one of 1,2,4,8")
         if device_batch_size <= 0 or total_batch_size <= 0:
             raise ValueError("batch sizes must be positive")
+        if (
+            not math.isfinite(learning_rate_multiplier)
+            or learning_rate_multiplier <= 0.0
+        ):
+            raise ValueError("learning_rate_multiplier must be finite and > 0")
         if data_shards <= 0 or eval_tokens <= 0 or core_max_per_task <= 0:
             raise ValueError("data/evaluation settings must be positive")
 
@@ -1226,6 +1252,7 @@ if args.stop_after_step >= 0:
                 "num_gpus": num_gpus,
                 "device_batch_size": device_batch_size,
                 "total_batch_size": total_batch_size,
+                "learning_rate_multiplier": learning_rate_multiplier,
                 "data_shards": data_shards,
                 "eval_tokens": eval_tokens,
                 "core_max_per_task": core_max_per_task,
@@ -1261,6 +1288,16 @@ if args.stop_after_step >= 0:
         print(
             "[modal/simulation] fixed scheduler horizon across every training "
             "segment; optimizer+dataloader resume at milestones",
+            flush=True,
+        )
+        print(
+            "[modal/simulation] LR multiplier="
+            f"{learning_rate_multiplier:g} "
+            "(pre-batch-scale: "
+            f"embedding={0.3 * learning_rate_multiplier:.6g}, "
+            f"unembedding={0.008 * learning_rate_multiplier:.6g}, "
+            f"matrix={0.02 * learning_rate_multiplier:.6g}, "
+            f"scalar={0.5 * learning_rate_multiplier:.6g})",
             flush=True,
         )
         print(
@@ -1309,6 +1346,8 @@ if args.stop_after_step >= 0:
                     str(total_batch_size),
                     "--device-batch-size",
                     str(device_batch_size),
+                    "--learning-rate-multiplier",
+                    str(learning_rate_multiplier),
                     "--data-shards",
                     str(data_shards),
                     "--git-commit",
@@ -1434,6 +1473,7 @@ if args.stop_after_step >= 0:
                 num_gpus=num_gpus,
                 device_batch_size=device_batch_size,
                 total_batch_size=total_batch_size,
+                learning_rate_multiplier=learning_rate_multiplier,
             )
             _run_streamed(
                 cmd,
@@ -1756,6 +1796,7 @@ if args.stop_after_step >= 0:
         num_gpus: int = 1,
         device_batch_size: int = 1,
         total_batch_size: int = 16_384,
+        learning_rate_multiplier: float = 1.0,
         data_shards: int = 240,
         eval_tokens: int = 4_194_304,
         core_max_per_task: int = 500,
@@ -1784,6 +1825,7 @@ if args.stop_after_step >= 0:
             "num_gpus": num_gpus,
             "device_batch_size": device_batch_size,
             "total_batch_size": total_batch_size,
+            "learning_rate_multiplier": learning_rate_multiplier,
             "data_shards": data_shards,
             "eval_tokens": eval_tokens,
             "core_max_per_task": core_max_per_task,
@@ -1821,6 +1863,7 @@ if args.stop_after_step >= 0:
                 "num_gpus",
                 "device_batch_size",
                 "total_batch_size",
+                "learning_rate_multiplier",
                 "data_shards",
                 "eval_tokens",
                 "core_max_per_task",
@@ -1835,7 +1878,13 @@ if args.stop_after_step >= 0:
                 "revision",
             )
             for key in saved_keys:
-                common[key] = pending[key]
+                if key == "learning_rate_multiplier" and key not in pending:
+                    # Backward compatibility for pending jobs created before
+                    # this option existed: those jobs necessarily used the
+                    # unmodified nanochat LR defaults, i.e. multiplier 1.0.
+                    common[key] = 1.0
+                else:
+                    common[key] = pending[key]
             common["git_commit"] = pending.get("git_commit", "")
             common["resume_job"] = pending
             requested_num_gpus = int(pending["num_gpus"])
