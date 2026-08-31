@@ -1,4 +1,4 @@
-""" nanochat/gpt.py
+"""nanochat/gpt.py
 GPT model (rewrite, a lot simpler)
 Notable features:
 - rotary embeddings (and no positional embeddings)
@@ -76,12 +76,13 @@ sector — no new parameters, checkpoint structure unchanged (unless witten=True
 The decoupled two-projection form (frozen qkv + trainable hmap_qk) belongs to the
 transfer-ansatz/finetune experiment and is not in this file.
 
-Implementation is EAGER (explicit (B,H,T,T) logits): transparent, no FA3 head-dim
-questions, you own the operator outright. Memory scales with T^2 — reduce
---device-batch-size (e.g. 8 or 4) vs the default 32. Training and naive generate()
-only; kv-cache fast inference (engine.py) is not wired for HMAP. Intended to run
-with window_pattern="L" (full causal context); sliding windows are honored if
-present (mask reproduces FA3 (left,0) semantics). estimate_flops() does not count
+Implementation is EAGER (explicit (B,H,T,T) logits) for training: transparent,
+no FA3 head-dim questions, you own the operator outright. Memory scales with T^2 —
+reduce --device-batch-size for the custom arms. Cached causal inference is supported
+through nanochat.variant_cache.VariantKVCache, which stores Q/K/V(+g) because the
+operator scores past positions as both query- and key-side vectors. Standard attention
+continues to use nanochat.engine.Engine / FA3 KV caching. Sliding windows are honored.
+estimate_flops() does not count
 the extra score matmuls, so MFU under-reads for HMAP runs: compare variants on
 loss-vs-step / loss-vs-wallclock, not MFU.
 =====================================================================================
@@ -252,6 +253,25 @@ class CausalSelfAttention(nn.Module):
             _EAGER_MASK_CACHE[key] = mask
         return mask[:T, :T]
 
+    @staticmethod
+    def _get_decode_mask(T, T0, window_size, device):
+        """Additive causal mask for cached custom-operator inference.
+
+        ``T`` new query rows occupy absolute positions ``T0 .. T0+T-1`` and
+        score all cached positions ``0 .. T0+T-1``. Shape is (T, T0+T).
+        Sliding-window semantics match the eager/FA3 path.
+        """
+        left = window_size[0]
+        Tk = T0 + T
+        i = torch.arange(T0, Tk, device=device).view(T, 1)
+        j = torch.arange(Tk, device=device).view(1, Tk)
+        allowed = j <= i
+        if left >= 0:
+            allowed = allowed & (j >= i - left)
+        mask = torch.zeros(T, Tk, device=device, dtype=torch.float32)
+        mask.masked_fill_(~allowed, float("-inf"))
+        return mask.to(COMPUTE_DTYPE)
+
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
@@ -287,12 +307,134 @@ class CausalSelfAttention(nn.Module):
         # (1,1) attention (exact).
         # ------------------------------------------------------------------
         if self.attn_variant == "hmap":
-            if kv_cache is not None:
-                raise NotImplementedError(
-                    "attn_variant='hmap' does not support kv-cache inference yet. "
-                    "Training and naive generate() work.")
             a = self.hmap_alpha
             b = self.hmap_beta
+
+            # Cached inference is causal-only. Training and ordinary evaluation
+            # continue through the exact pre-existing eager path below.
+            if kv_cache is not None:
+                if self.bidirectional:
+                    raise AssertionError(
+                        "VariantKVCache inference is causal-only"
+                    )
+                if not hasattr(kv_cache, "get_layer_qkvg"):
+                    raise TypeError(
+                        "attn_variant='hmap' inference requires "
+                        "nanochat.variant_cache.VariantKVCache; the standard "
+                        "KVCache does not retain past q/g."
+                    )
+
+                T0 = kv_cache.get_pos()
+
+                # g for the NEW positions only. In the canonical release
+                # convention, exact/Doob weight is (1-a), so g is live when
+                # a < 1 (DMAP/HMAP and square interiors), not when a > 0.
+                g_new = None
+                if a < 1.0:
+                    m_new = (q + k) * (0.5 ** 0.5)
+                    g32 = 0.5 * (m_new.float() * m_new.float()).sum(-1)
+                    if b > 0.0:
+                        n_new = (q - k) * (0.5 ** 0.5)
+                        g32 = (
+                            g32
+                            - b * 0.5
+                            * (n_new.float() * n_new.float()).sum(-1)
+                        )
+                    if self.witten:
+                        qw = self.c_qw(x).view(
+                            B, T, self.n_head, self.head_dim
+                        )
+                        kw = self.c_kw(x).view(
+                            B, T, self.n_head, self.head_dim
+                        )
+                        qw, kw = norm(qw) * 1.2, norm(kw) * 1.2
+                        g32 = g32 + (qw.float() * kw.float()).sum(-1)
+                    g_new = g32.to(q.dtype)  # (B,T,H)
+
+                # Cache vectors exactly as scored by the operator:
+                # post-RoPE, post-QK-norm, post-1.2x; v includes VE mixing.
+                kv_cache.write(self.layer_idx, T0, q, k, v, g_new)
+                q_all, k_all, v_all, g_all = kv_cache.get_layer_qkvg(
+                    self.layer_idx, T0 + T
+                )
+
+                qh = q_all.transpose(1, 2)  # (B,H,Tk,D)
+                kh = k_all.transpose(1, 2)
+                vh = v_all.transpose(1, 2)
+                m = (qh + kh) * (0.5 ** 0.5)
+                n = (qh - kh) * (0.5 ** 0.5) if b > 0.0 else None
+                g = (
+                    g_all.transpose(1, 2)
+                    if g_all is not None
+                    else None
+                )  # (B,H,Tk)
+                Tk = qh.shape[2]
+
+                scale = self.head_dim ** -0.5
+                mask = self._get_decode_mask(
+                    T, T0, window_size, x.device
+                )  # (T,Tk)
+
+                def _cached_rows(rows):
+                    """Score absolute NEW query rows against all cached columns."""
+                    logits = 0.5 * (
+                        m[..., rows, :] @ m.transpose(-2, -1)
+                    )
+                    if b > 0.0:
+                        logits = logits - b * 0.5 * (
+                            n[..., rows, :] @ n.transpose(-2, -1)
+                        )
+                    if a > 0.0:
+                        qk = (
+                            qh[..., rows, :]
+                            @ kh.transpose(-2, -1)
+                        )
+                        kq = (
+                            kh[..., rows, :]
+                            @ qh.transpose(-2, -1)
+                        )
+                        logits = logits + a * 0.5 * (qk - kq)
+                    if a < 1.0:
+                        if g is None:
+                            raise RuntimeError(
+                                "VariantKVCache was created without g storage "
+                                "for an operator with active Doob potential"
+                            )
+                        logits = logits + (1.0 - a) * 0.5 * (
+                            g[..., rows].unsqueeze(-1)
+                            - g.unsqueeze(-2)
+                        )
+
+                    # Decode-mask rows are relative to the new-token block.
+                    mrows = slice(rows.start - T0, rows.stop - T0)
+                    logits = logits * scale + mask[mrows]
+                    return logits.softmax(dim=-1) @ vh
+
+                # Prefill can contain many rows; one-token decode contains one.
+                # Chunking avoids materializing full T x Tk logits.
+                chunk = 256
+                outs = []
+                for s in range(T0, T0 + T, chunk):
+                    rows = slice(s, min(s + chunk, T0 + T))
+                    outs.append(_cached_rows(rows))
+                y = torch.cat(outs, dim=-2)
+
+                # All layers must observe the same T0. Advance only after the
+                # final layer has written its slice.
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+
+                y = (
+                    y.transpose(1, 2)
+                    .contiguous()
+                    .view(B, T, -1)
+                )
+                y = self.c_proj(y)
+                return y
+
+            # ---------------- Existing uncached eager path -----------------
+            # Keep this path numerically unchanged for training, BPB, CORE,
+            # induction, DAC, and all existing simulation checkpoints.
             qh = q.transpose(1, 2)   # (B, H, T, D)
             kh = k.transpose(1, 2)
             vh = v.transpose(1, 2)
@@ -733,7 +875,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', logits_last_only=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -785,8 +927,14 @@ class GPT(nn.Module):
         x = norm(x)
 
         # Forward the lm_head (compute logits)
+        # Cached generation only needs the newest position; slicing before
+        # lm_head avoids a large (B,T,V) prefill-logit allocation.
+        if logits_last_only:
+            if targets is not None:
+                raise ValueError("logits_last_only is inference-only")
+            x = x[:, -1:, :]
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        logits = self.lm_head(x) # (B, T_or_1, padded_vocab_size)
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
